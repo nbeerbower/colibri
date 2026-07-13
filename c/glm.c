@@ -27,7 +27,9 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
-#include <sys/select.h>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -439,6 +441,8 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
  * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
 #define IDOT_KERNEL "avx512-vnni"
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+#define IDOT_KERNEL "avx-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
 #elif defined(__ARM_NEON)
@@ -475,6 +479,12 @@ static inline int hsum256_i32(__m256i v){
     return _mm_cvtsi128_si32(lo);
 }
 #endif
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+/* hsum di un __m128i a 4 lane s32 (l'AVX-VNNI 128-bit accumula su 4 lane). */
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
+}
+#endif
 /* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
  * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
@@ -493,6 +503,18 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
         acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
     }
     sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 byte/iter. Stesso trucco del
+     * segno della variante 512-bit: |w| via abs, segno piegato in x con maschera
+     * (w==0 -> product 0). __AVX2__ serve per _mm_sign_epi8 / abs. */
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w); _mm_sign zona __AVX2__ */
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
     __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
     for(;i+32<=I;i+=32){
@@ -563,6 +585,23 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
     }
     sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit, int4: 16 byte = 32 nibble -> int8 [-8,7] in due half
+     * (n0/n1), ciascuno alimentato a un vpdpbusd da 16 byte. Stesso unpack
+     * 128-bit del ramo AVX2 sotto; 32 elementi/iter come li. */
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* nibble in ordine */
+        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
     const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
     const __m256i ones=_mm256_set1_epi16(1);
@@ -1128,7 +1167,9 @@ static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
-    void *base=NULL; struct stat st;
+    void *base=NULL;
+#if defined(__APPLE__) || defined(__linux__)
+    struct stat st;
     if(g_nmaps<512 && fstat(fd,&st)==0){
         size_t len=((size_t)st.st_size+16383)&~(size_t)16383;
         void *p=mmap(NULL,len,PROT_READ,MAP_SHARED,fd,0);
@@ -1139,6 +1180,7 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#endif
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
@@ -1198,7 +1240,9 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
              * residency. This is pread's I/O without the copy and without the slab. */
             for(int k=0;k<3;k++){
                 char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
+#if defined(__APPLE__) || defined(__linux__)
                 madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+#endif
                 volatile char acc=0;
                 for(size_t i=0;i<n;i+=4096) acc+=p[i];
                 acc+=p[n-1]; (void)acc;
@@ -3082,6 +3126,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 }
 
 static void run_serve_mux(Model *m, const char *snap){
+#if defined(__APPLE__) || defined(__linux__)
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
@@ -3123,9 +3168,33 @@ static void run_serve_mux(Model *m, const char *snap){
     usage_save(m);
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
+#else
+    /* SERVE_BATCH (continuous batching) uses select() on stdin, a Unix-ism.
+     * Not yet ported to native Windows — fall back to the single-sequence
+     * serve path (run_serve). Remove this stub once select()-free polling
+     * (e.g. WaitForSingleObject on the stdin handle) is implemented. */
+    (void)snap;
+    fprintf(stderr,"[SERVE_BATCH] continuous-batching serve is not yet available on "
+                   "native Windows; use the default serve path (omit SERVE_BATCH).\n");
+#endif
 }
 
 static void run_serve(Model *m, const char *snap){
+    /* Serve mode speaks a byte protocol over BOTH stdout and stdin:
+     *   stdout: \x01\x01READY\x01\x01\n, STAT lines, \x01\x01END\x01\x01\n
+     *   stdin:  text lines plus \x02RESET / \x02MORE control bytes.
+     * 'coli' matches the sentinels with endswith() and a "^STAT ..." regex,
+     * so they must arrive byte-exact (LF, no CR). On Windows the CRT opens
+     * both handles in TEXT mode: stdout translates '\n'->'\r\n' (so the READY
+     * sentinel never matches and chat hangs at ~10 GB resident), and stdin
+     * translates '\r\n'->'\n' and rejects writes of raw bytes with EINVAL,
+     * breaking the control protocol. Put BOTH handles in BINARY mode so the
+     * protocol bytes are exact in both directions. No-op on Linux/macOS. */
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
