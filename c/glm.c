@@ -4016,7 +4016,8 @@ typedef struct {
     float temp, top_p;
     double started;
     uint64_t hits0, miss0;
-    ProfBase pb;                         /* PROF=1: window start (same convention as hits0) */
+    ProfBase pb;                         /* phase-time window start (same convention as hits0):
+                                            feeds the PROF protocol line and the PROF=1 report */
 } ServeReq;
 
 static void mux_data(Tok *T, unsigned long long id, int token){
@@ -4033,6 +4034,16 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     tiers_emit(m);
     emap_emit(m);
     hits_emit(m);
+    /* PROF: per-turn phase timings for the dashboard profiling page —
+     * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw>".
+     * With KV_SLOTS>1 concurrent slots share the batched forwards, so the shares
+     * describe the whole engine over the window, not the single request (same
+     * convention as the STAT hit% below). */
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
+           r->prompt_tokens,r->emitted,
+           m->t_edisk-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
+           m->t_attn-r->pb.attn,m->t_head-r->pb.head,
+           (unsigned long long)(m->n_fw-r->pb.n_fw));
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
@@ -4102,7 +4113,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
-    if(g_prof) prof_base(m,&r->pb);
+    prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
     int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
     g_temp=r->temp; g_nuc=r->top_p;
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);

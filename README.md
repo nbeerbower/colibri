@@ -540,9 +540,10 @@ What you get:
 
 - **Chat** with live metrics: a flashing token counter while generating, then tok/s, time-to-first-token, prompt→completion counts and queue wait;
 - **Runtime panel**: your hardware (CPU, GPUs + VRAM, RAM, cores), the scheduler, and the live expert-tier bar — how many of the 19,456 experts sit in VRAM / RAM / disk right now;
-- **Brain**: the whole model as a 76×256 cortex, one cell per expert. Colour = tier, brightness = routing heat, and the experts routed in each turn flash white and decay — you watch the model think. Hover any cell for its tier, heat and [measured topic affinity](https://github.com/JustVugg/colibri/issues/175) (specialists for code, Chinese, math, law… live in layers 11–22).
+- **Brain**: the whole model as a 76×256 cortex, one cell per expert. Colour = tier, brightness = routing heat, and the experts routed in each turn flash white and decay — you watch the model think. Hover any cell for its tier, heat and [measured topic affinity](https://github.com/JustVugg/colibri/issues/175) (specialists for code, Chinese, math, law… live in layers 11–22);
+- **Profiling**: where each turn's wall time went — I/O wait vs expert matmul vs attention vs LM head — as stacked per-turn bars, plus throughput history, tokens-per-forward batching, and a table of the recent turns. The same phase timers behind the `PROFILE` line, streamed live.
 
-The dashboard talks to the engine over two tiny protocol lines (`TIERS`, `EMAP`/`HITS`) and plain JSON endpoints — nothing heavier than the engine itself.
+The dashboard talks to the engine over a few tiny protocol lines (`TIERS`, `EMAP`/`HITS`, `PROF`) and plain JSON endpoints — nothing heavier than the engine itself.
 
 ## Got a better machine? Try it — here's what to expect
 
