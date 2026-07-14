@@ -4016,6 +4016,7 @@ typedef struct {
     float temp, top_p;
     double started;
     uint64_t hits0, miss0;
+    ProfBase pb;                         /* PROF=1: window start (same convention as hits0) */
 } ServeReq;
 
 static void mux_data(Tok *T, unsigned long long id, int token){
@@ -4036,6 +4037,10 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
     fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
+    /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
+     * share the batched forwards, so the shares describe the engine, not the
+     * single request (same convention as the STAT hit%% above). */
+    if(g_prof) prof_report(m,&r->pb,dt,r->emitted,stderr);
     r->active=0;
 }
 
@@ -4097,6 +4102,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    if(g_prof) prof_base(m,&r->pb);
     int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
     g_temp=r->temp; g_nuc=r->top_p;
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
@@ -4168,8 +4174,10 @@ static void run_serve_mux(Model *m, const char *snap){
         for(int i=0;i<nctx;i++) if(req[i].active){
             rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
         }
+        double tf0=g_prof?now_s():0;
         float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
         m->n_fw++;
+        if(g_prof) prof_lat(now_s()-tf0);
         for(int s=0;s<S;s++){
             int i=slots[s]; ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
             sc->len++; g_temp=r->temp; g_nuc=r->top_p;
