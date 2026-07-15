@@ -95,7 +95,18 @@ static inline int compat_open_direct(const char *path){
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
 
-/* --- posix_fadvise: no-op (advisory only; safe to ignore) --- */
+/* --- posix_fadvise: Windows has no direct equivalent. Semantics:
+ *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
+ *                   pages resident. Implemented as an overlapped background ReadFile
+ *                   into a throwaway scratch buffer (fire-and-forget readahead). Called
+ *                   from the dedicated PILOT I/O thread / next-block readahead in moe(),
+ *                   NEVER inline on the hot path (the existing comment at glm.c:2847
+ *                   measures inline fadvise submit at ~0.5ms x 169k calls = +92s/48tok).
+ *                   Each call owns its OVERLAPPED + scratch buffer -> thread-safe.
+ *      DONTNEED  -> no-op: Windows' standby-list trimming self-regulates under pressure,
+ *                   and on a low-RAM host keeping the pages is what we want for reuse.
+ *                   Matches macOS (compat.h:16-19) which no-ops DONTNEED for the same
+ *                   reason. The engine only ever uses DONTNEED as an advisory. */
 #ifndef POSIX_FADV_NORMAL
 #define POSIX_FADV_NORMAL      0
 #define POSIX_FADV_RANDOM      1
@@ -104,7 +115,29 @@ static inline int compat_open_direct(const char *path){
 #define POSIX_FADV_DONTNEED    4
 #define POSIX_FADV_NOREUSE     5
 #endif
-#define posix_fadvise(fd,off,len,advice) do{(void)(fd);(void)(off);(void)(len);(void)(advice);}while(0)
+static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
+    if(advice!=POSIX_FADV_WILLNEED || len<=0) return 0;
+    intptr_t osfh=_get_osfhandle(fd);
+    if(osfh==-1 || osfh==-2) return 0;
+    HANDLE h=(HANDLE)osfh;
+    /* Cap the readahead window: reading a whole 19MB expert per hint is fine on the
+     * PILOT thread, but a pathological huge len would spike transient memory. */
+    size_t rdlen = (len>(off_t)(64*1024*1024)) ? (size_t)(64*1024*1024) : (size_t)len;
+    char *buf=(char*)_aligned_malloc(rdlen, 4096);
+    if(!buf) return -1;
+    OVERLAPPED ov={0};
+    ov.Offset     = (DWORD)( (off_t)off        & 0xFFFFFFFFULL);
+    ov.OffsetHigh = (DWORD)(((off_t)off >> 32) & 0xFFFFFFFFULL);
+    /* Issue an overlapped read. With a non-OVERLAPPED-opened handle ReadFile still
+     * accepts lpOverlapped (it carries the 64-bit offset) and blocks until the read
+     * completes — but crucially it populates the standby page cache for this region,
+     * so the later synchronous pread on the same offsets faults from RAM not disk. */
+    DWORD got=0;
+    ReadFile(h, buf, (DWORD)rdlen, &got, &ov);
+    _aligned_free(buf);
+    return 0;
+}
+#define posix_fadvise compat_fadvise
 
 /* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking

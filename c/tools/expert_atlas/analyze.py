@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--min-count", type=int, default=30)
     ap.add_argument("--min-runs", type=int, default=2, help="must fire in >= this many of the top category's runs")
     ap.add_argument("--out", default="experts.json")
+    ap.add_argument("--web", default="", help="also write the web-dashboard experts.json (Atlas/Brain hover)")
     a = ap.parse_args()
 
     # run[(cat,idx)][(layer,expert)] = count ; run_tot[(cat,idx)] = total
@@ -120,6 +121,19 @@ def main():
           f"({100*len(strong)/max(1,len(atlas)):.1f}%)")
     json.dump({"categories": cats, "experts": atlas}, open(a.out, "w"), indent=1)
     print(f"wrote {a.out}")
+
+    if a.web:
+        # Same atlas, keyed "layer:expert" with per-expert affinity/entropy/top/label —
+        # the shape the web dashboard consumes (Atlas galaxy, Brain hover).
+        web = {}
+        for r in atlas:
+            aff = {c: v for c, v in r["p"].items() if v > 0}
+            H = -sum(v * math.log2(v) for v in aff.values())
+            web[f"{r['layer']}:{r['expert']}"] = {
+                "affinity": aff, "entropy": round(H, 2), "top": r["top_topic"],
+                "label": f"specialist: {r['top_topic']}" if r["spec"] >= 0.5 else "generalist"}
+        json.dump({"categories": cats, "experts": web}, open(a.web, "w"))
+        print(f"wrote {a.web} (dashboard format, {len(web):,} experts)")
 
 
 if __name__ == "__main__":

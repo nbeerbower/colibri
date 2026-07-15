@@ -35,6 +35,7 @@
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
+#include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
 #include "st.h"
 #ifdef __linux__
@@ -145,6 +146,9 @@ typedef struct {
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
+    FILE *disk_fp;       /* kept-open handle: fopen once, fwrite per turn, fclose at exit (#4) */
+    uint8_t *disk_buf;   /* staging buffer: one contiguous record per position (#1) */
+    int64_t disk_buf_cap;
 } KVState;
 
 typedef struct {
@@ -614,18 +618,30 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 #elif defined(__ARM_NEON)
     /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
      * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* 4 accumulatori indipendenti: SDOT ha latenza ~3-4 cicli, con un solo acc la
+     * catena seriale strozza il core a ~26 GB/s di pesi; con 4 lane indipendenti il
+     * dot diventa memory-bound (misurato su M4: 26 -> 63 GB/s per core, 2.4x). */
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        a0=vdotq_s32(a0,vld1q_s8(w+i),   vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vld1q_s8(w+i+16),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vld1q_s8(w+i+32),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vld1q_s8(w+i+48),vld1q_s8(x+i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+16<=I;i+=16) acc=vdotq_s32(acc,vld1q_s8(w+i),vld1q_s8(x+i));
+    sum=vaddvq_s32(acc);
+#else
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+16<=I;i+=16){
         int8x16_t wv=vld1q_s8(w+i), xv=vld1q_s8(x+i);
-#if defined(__ARM_FEATURE_DOTPROD)
-        acc=vdotq_s32(acc,wv,xv);
-#else
         int16x8_t p=vmull_s8(vget_low_s8(wv),vget_low_s8(xv));
         p=vmlal_s8(p,vget_high_s8(wv),vget_high_s8(xv));
         acc=vpadalq_s16(acc,p);
-#endif
     }
     sum=vaddvq_s32(acc);
+#endif
 #elif defined(__VSX__)
     /* POWER8: vec_msum (s8 x u8 -> s32) somma i prodotti byte DIRETTAMENTE in lane
      * s32, 16 byte/iter: il bound anti-saturazione a 16 bit di maddubs qui non serve.
@@ -705,6 +721,28 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     sum=hsum256_i32(acc);
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* 4 accumulatori indipendenti (vedi dot_i8i8): spezza la catena seriale su acc.
+     * Misurato su M4: 12.4 -> 29.9 GB/s di pesi per core (2.4x). */
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        uint8x16_t byA=vld1q_u8(w4+(i>>1)), byB=vld1q_u8(w4+(i>>1)+16);
+        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q), vshrq_n_u8(byA,4)); /* nibble in ordine */
+        uint8x16x2_t zB=vzipq_u8(vandq_u8(byB,m4q), vshrq_n_u8(byB,4));
+        a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(zA.val[0]),b8q),vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(zA.val[1]),b8q),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vsubq_s8(vreinterpretq_s8_u8(zB.val[0]),b8q),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vsubq_s8(vreinterpretq_s8_u8(zB.val[1]),b8q),vld1q_s8(x+i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
+        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
+    }
+    sum=vaddvq_s32(acc);
+#else
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+32<=I;i+=32){
         uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
@@ -712,18 +750,15 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
         int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
         int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
-#if defined(__ARM_FEATURE_DOTPROD)
-        acc=vdotq_s32(acc,w0,x0); acc=vdotq_s32(acc,w1,x1);
-#else
         int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: nessun overflow */
         p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
         acc=vpadalq_s16(acc,p);
         p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
         p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
         acc=vpadalq_s16(acc,p);
-#endif
     }
     sum=vaddvq_s32(acc);
+#endif
 #elif defined(__VSX__)
     /* 16 byte = 32 nibble. vec_mergeh/vec_mergel su ppc64le (GCC) interallacciano come
      * unpacklo/unpackhi x86 (verificato empiricamente su POWER8): i nibble escono in
@@ -899,6 +934,11 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded per layer across the
+                               * batch-union. Reduces disk I/O on cold/low-RAM hosts by dropping the
+                               * lowest-gate-weight experts from the cross-position union. MoE-Spec
+                               * (arXiv 2602.16052): top-32 of 64 capture 93% routing weight. */
+static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET across all layers */
 /* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
  * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
 static int g_cache_route=0;
@@ -1801,7 +1841,10 @@ static int uring_wait_all(UringBatch *b){
  * condvar exist ONLY to park/wake idle workers, never for correctness. Gated
  * behind PIPE=1; OFF => the original blocking-load + serial-matmul path runs
  * byte-identically. */
-static int g_pipe=0;      /* PIPE=1: async expert-load pipeline (default OFF) */
+static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for Windows
+                           * (parsed in main: getenv("PIPE")?:1 on _WIN32, :0 elsewhere).
+                           * Keeps expert pread off the forward-pass thread so loads overlap
+                           * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
 static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
 typedef struct {
@@ -2620,6 +2663,67 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
         int e=idxs[(int64_t)s*K+kk];
         if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
+    }
+    /* EXPERT_BUDGET: cap distinct experts per layer to reduce disk I/O on cold/low-RAM
+     * hosts. MISS-AWARE: always keep cache hits (pin/LRU — they're free, no disk I/O),
+     * only drop from misses. From the misses, keep the highest-aggregate-gate-weight
+     * ones up to the budget; drop the rest from idxs[] so they're never loaded.
+     * (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93% routing weight.)
+     * Complementary to TOPP (per-position) — this trims cross-position. */
+    if(g_expert_budget>0 && nu>g_expert_budget){
+        /* compute aggregate gate weight per unique expert */
+        float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
+        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
+            int e=idxs[(int64_t)s*K+kk];
+            for(int j=0;j<nu;j++) if(uniq[j]==e){ wsum[j]+=ws[(int64_t)s*K+kk]; break; }
+        }
+        /* residency pre-scan: which experts are already in pin or ecache (hits)? */
+        unsigned char *is_hit=calloc(nu,1); int nhits=0;
+        for(int j=0;j<nu;j++){ int eid=uniq[j];
+            int found=0;
+            ESlot *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ found=1; break; }
+            if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ found=1; break; } }
+            if(found){ is_hit[j]=1; nhits++; }
+        }
+        /* budget for misses = total budget - hits already kept (min 0) */
+        int miss_budget = g_expert_budget - nhits; if(miss_budget<0) miss_budget=0;
+        /* mark which unique experts to keep (1) or drop (0): keep all hits, fill rest
+         * with top-weight misses up to miss_budget */
+        unsigned char *keep=calloc(nu,1); int nkeep=0;
+        for(int j=0;j<nu;j++) if(is_hit[j]){ keep[j]=1; nkeep++; }
+        for(int rank=0;rank<miss_budget;rank++){
+            int best=-1; float bv=-1e30f;
+            for(int j=0;j<nu;j++) if(!keep[j] && wsum[j]>bv){ bv=wsum[j]; best=j; }
+            if(best<0) break; keep[best]=1; nkeep++;
+        }
+        /* build a lookup: for each expert id, is it kept? (reuse seen[]) */
+        memset(seen,0,(size_t)E);
+        for(int j=0;j<nu;j++) if(keep[j]) seen[uniq[j]]=1;
+        int dropped=nu-nkeep; g_budget_dropped+=dropped;
+        /* remove dropped experts from each position's routing list */
+        for(int s=0;s<S;s++){
+            int w=0;
+            for(int kk=0;kk<keff[s];kk++){
+                int e=idxs[(int64_t)s*K+kk];
+                if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=ws[(int64_t)s*K+kk]; w++; }
+            }
+            if(w<keff[s]){
+                keff[s]=w;
+                /* renormalize remaining weights per position */
+                if(c->norm_topk && w>0){
+                    float sm=0; for(int kk=0;kk<w;kk++) sm+=ws[(int64_t)s*K+kk]; sm+=1e-20f;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]/=sm;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=c->routed_scale;
+                }
+            }
+        }
+        /* compact uniq[] to kept experts only */
+        int nu2=0;
+        for(int j=0;j<nu;j++) if(keep[j]) uniq[nu2++]=uniq[j];
+        nu=nu2;
+        free(wsum); free(is_hit); free(keep);
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
@@ -3795,12 +3899,34 @@ static void stops_arm(const Cfg *c, int tok_eos){
  * all: storia token (capacita' >= kv+n_new+g_draft+2), kv = token gia' in KV.
  * logit = logits della posizione kv-1 (dal prefill); viene liberato qui.
  * emit(tok,ud) per ogni token emesso. Ritorna i token emessi; *kv_out = nuova kv. */
+/* STOP MORBIDO (serve/chat): SIGINT chiude il turno CORRENTE per la stessa via
+ * del tetto NGEN (stats, usage_save, KV append, sentinella END tutti normali)
+ * invece di uccidere il motore; :more puo' continuare la risposta interrotta.
+ * Il flag e' armato solo nei serve-loop (intr_install): nei run one-shot e in
+ * validazione SIGINT resta il default (morte immediata). Solo POSIX: su
+ * Windows il comportamento di Ctrl-C non cambia.
+ * EN: soft stop (serve/chat): SIGINT ends the CURRENT turn through the same
+ * path as the NGEN cap — stats/usage/KV/END sentinel all normal — instead of
+ * killing the engine; :more can continue the interrupted answer. Armed only
+ * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
+static volatile sig_atomic_t g_intr=0;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+static void intr_sig(int s){ (void)s; g_intr=1; }
+static void intr_install(void){
+    struct sigaction sa; memset(&sa,0,sizeof(sa));
+    sa.sa_handler=intr_sig; sigemptyset(&sa.sa_mask);
+    sa.sa_flags=SA_RESTART;              /* getline/pread non devono vedere EINTR */
+    sigaction(SIGINT,&sa,NULL);
+}
+#else
+static void intr_install(void){}
+#endif
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
-    while(emitted<n_new && !done){
+    while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
@@ -4078,6 +4204,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("experts loaded/token: %.1f (per-layer %.2f across %d; baseline topk=%d) | TOPK=%d TOPP=%.2f",
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
     if(g_cache_route) printf(" | CACHE_ROUTE J=%d M=%d P=%.2f alpha=%.2f", g_route_j, g_route_m, g_route_p, g_route_alpha);
+    if(g_expert_budget) printf(" | EXPERT_BUDGET=%d (dropped %lld experts, ~%.1f GB I/O saved)", g_expert_budget, (long long)g_budget_dropped, g_budget_dropped*18.9e6/1e9);
     printf("\n");
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
@@ -4259,36 +4386,73 @@ static void kv_hdr(Model *m, int32_t *h, int nrec){
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
     h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
 }
+/* Bytes of one on-disk record: [tok i32][Lc+Rc per layer][Ic per DSA layer].
+ * Layout matches what kv_disk_append writes and kv_disk_load reads. */
+static int64_t kv_rec_bytes(Model *m){
+    Cfg *c=&m->c;
+    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
+    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
+    return rec;
+}
+/* Open the persistent handle lazily; write the header if the file is new. After
+ * this returns successfully, k->disk_fp is valid for the engine's lifetime and
+ * positioned at end-of-header (nrec==0 case) or wherever the caller seeks. */
+static int kv_disk_open(Model *m){
+    KVState *k=m->kv;
+    if(k->disk_fp) return 1;
+    k->disk_fp=fopen(k->disk_path,"r+b");
+    if(!k->disk_fp){                       /* not there yet -> create + header */
+        k->disk_fp=fopen(k->disk_path,"wb");
+        if(!k->disk_fp) return 0;
+        int32_t h[8]; kv_hdr(m,h,0);
+        fwrite(KV_MAGIC,1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
+        fflush(k->disk_fp);
+        fclose(k->disk_fp);
+        k->disk_fp=fopen(k->disk_path,"r+b");   /* reopen r+b for append */
+        if(!k->disk_fp) return 0;
+    }
+    return 1;
+}
 static void kv_disk_truncate(Model *m, int nrec){
     if(!g_kvsave) return;
     KVState *k=m->kv;
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }  /* drop to shrink on disc */
     FILE *f=fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
     k->disk_nrec=nrec;
-    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
+    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
+    fflush(f); fclose(f);
 }
 static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
 static void kv_disk_append(Model *m, const int *hist, int len){
     KVState *k=m->kv;
     if(!g_kvsave || len<=k->disk_nrec) return;
     Cfg *c=&m->c;
-    FILE *f=fopen(k->disk_path,"r+b");
-    if(!f){ f=fopen(k->disk_path,"wb"); if(!f) return;
-        int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f); }
-    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
-    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
+    if(!kv_disk_open(m)) return;
+    FILE *f=k->disk_fp;
+    int64_t rec = kv_rec_bytes(m);
+    /* grow the contiguous staging buffer if the record is larger (#1 batching) */
+    if(rec > k->disk_buf_cap){
+        uint8_t *nb=realloc(k->disk_buf, rec);
+        if(!nb) return;                    /* OOM: skip this turn, retry next */
+        k->disk_buf=nb; k->disk_buf_cap=rec;
+    }
     fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
     for(int p=k->disk_nrec;p<len;p++){
-        int32_t tk=hist[p]; fwrite(&tk,4,1,f);
+        uint8_t *b=k->disk_buf;            /* pack token + every layer into one record */
+        *(int32_t*)b = hist[p]; b+=4;
         for(int i=0;i<c->n_layers;i++){
-            fwrite(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f);
-            fwrite(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f);
+            memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
+            memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
         }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
-            fwrite(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f);
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
+            memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
+        }
+        fwrite(k->disk_buf, 1, (size_t)rec, f);   /* one fwrite per position (was ~157) */
     }
     fflush(f);                                   /* dati prima, contatore poi */
-    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
+    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
+    fflush(f);                                   /* persist the counter too */
     k->disk_nrec=len;
 }
 static int kv_disk_load(Model *m, int *hist, int maxctx){
@@ -4343,6 +4507,8 @@ static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, in
 
 static void serve_ctx_free(Model *m, ServeCtx *s){
     KVState *k=&s->kv; int NR=m->c.n_layers+1;
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
+    free(k->disk_buf); k->disk_buf=NULL;
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
@@ -4428,6 +4594,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
         kv_disk_truncate(m,sc->len); }
     int add=nt-sc->len;
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
+    fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
@@ -4465,12 +4632,17 @@ static void run_serve_mux(Model *m, const char *snap){
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
     setvbuf(stdin,NULL,_IONBF,0);
+    intr_install();                      /* Ctrl-C = chiudi i turni in volo, non il processo */
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
     hwinfo_emit(m);
     tiers_emit(m);
     emap_emit(m);
     int eof=0;
     for(;;){
+        if(g_intr){ g_intr=0;            /* stop morbido: ogni request attiva finisce ORA per la
+                                          * via normale di mux_done (DONE+stats+KV coerenti) */
+            for(int i=0;i<nctx;i++) if(req[i].active) mux_done(m,&ctx[i],&req[i]);
+        }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
@@ -4563,9 +4735,11 @@ static void run_serve(Model *m, const char *snap){
     #define len   (sc->len)
     #define first (sc->first)
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
+    intr_install();                      /* Ctrl-C = fine turno, non fine processo */
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     tiers_emit(m);
     while((nr=getline(&line,&cap,stdin))>0){
+        g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
             kv_disk_reset(m);
@@ -5213,6 +5387,7 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_expert_budget = getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
     g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
     g_route_j = getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m = getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;
@@ -5256,7 +5431,13 @@ int main(int argc, char **argv){
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
     g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
-    g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
+    g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
+#ifdef _WIN32
+        1                        /* default ON: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=0 opts out */
+#else
+        0
+#endif
+        ;
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;

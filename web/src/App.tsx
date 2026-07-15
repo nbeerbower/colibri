@@ -34,7 +34,11 @@ import { Brain } from "./Brain"
 import { persistPublicSettings, stored } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 
-const message = (role: ChatMessage["role"], content: string): ChatMessage => ({ id: crypto.randomUUID(), role, content })
+const message = (role: ChatMessage["role"], content: string): ChatMessage => {
+  let id: string
+  try { id = crypto.randomUUID() } catch { id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16) }) }
+  return { id, role, content }
+}
 
 export default function App() {
   // When the page is served by the engine itself (coli web), same-origin is the

@@ -317,10 +317,21 @@ class Spinner:
         if TTY: sys.stdout.write("\r\033[K"); sys.stdout.flush()
 
 def stream_turn(p, sentinel, on_bytes):
-    """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT."""
-    pend=b""
+    """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT.
+    Il PRIMO Ctrl-C durante lo stream non chiude la sessione: il motore (handler SIGINT)
+    chiude il turno per la via del tetto NGEN e noi dreniamo fino alla sentinella.
+    Un SECONDO Ctrl-C esce davvero."""
+    pend=b""; interrupted=False
     while True:
-        b=p.stdout.read(1)
+        try:
+            b=p.stdout.read(1)
+        except KeyboardInterrupt:
+            if interrupted or p.poll() is not None: raise
+            interrupted=True
+            try: p.send_signal(signal.SIGINT)   # non-TTY: il motore potrebbe non aver visto il Ctrl-C
+            except Exception: pass
+            print(f"\n  {C.yel}⏹ stopping… (Ctrl-C again to quit){C.r}", flush=True)
+            continue
         if b==b"": return None
         pend+=b
         if pend.endswith(sentinel):
@@ -328,7 +339,9 @@ def stream_turn(p, sentinel, on_bytes):
             if rest: on_bytes(rest)
             line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
-            return {"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
+            st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
+            if interrupted: st["interrupted"]=True
+            return st
         if len(pend)>len(sentinel):
             out=pend[:-len(sentinel)]; pend=pend[-len(sentinel):]
             on_bytes(out)
@@ -438,6 +451,8 @@ def cmd_chat(a):
         try: errlog.write(p.stderr.read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
+    p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
+                          # left unread it leaks into the first answer's text
     # READY received. Drain the child's stderr into errlog without blocking:
     # the engine is still alive (blocked on stdin), so a plain read() would
     # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
@@ -464,7 +479,7 @@ def cmd_chat(a):
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
                     print(f"  {C.dgray}{chunk}{C.r}")
     except Exception: pass
-    print(f"  {C.dim}type and press Enter · :more continues · :reset clears memory · :q exits{C.r}\n")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :more continues · :reset clears memory · :q exits{C.r}\n")
     w=term_w()-4
     def user_box(msg):
         """ri-disegna il messaggio dentro una box che si ADATTA su piu' righe:
@@ -529,10 +544,13 @@ def cmd_chat(a):
             el=time.time()-t0
             if st.get("tok"):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
-                if st["tok"]>=a.ngen:
+                if st.get("interrupted"):
+                    print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
+                elif st["tok"]>=a.ngen:
                     print(f"  {C.yel}…stopped at --ngen ({a.ngen}); type :more to continue the response{C.r}")
                 print()
             else:
+                if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted{C.r}")
                 print()
     except KeyboardInterrupt:
         print(f"\n  {C.dim}interrupted{C.r}")

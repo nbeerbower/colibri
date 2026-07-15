@@ -72,8 +72,13 @@ class TemplateTest(unittest.TestCase):
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
                          (4, 0.0, 1.0))
+        # max_tokens above the server cap is clamped, not rejected (#260): OpenAI
+        # clients default to large values; erroring breaks them.
+        self.assertEqual(generation_options({"max_tokens": 9, "temperature": 0, "top_p": 1}, 8),
+                         (8, 0.0, 1.0))
+        # non-positive / non-int max_tokens is still a hard error
         with self.assertRaises(APIError):
-            generation_options({"max_tokens": 9}, 8)
+            generation_options({"max_tokens": 0}, 8)
         with self.assertRaises(APIError):
             generation_options({"temperature": math.nan}, 8)
         with self.assertRaises(APIError):
