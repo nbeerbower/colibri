@@ -142,6 +142,9 @@ typedef struct {
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
+    FILE *disk_fp;       /* kept-open handle: fopen once, fwrite per turn, fclose at exit (#4) */
+    uint8_t *disk_buf;   /* staging buffer: one contiguous record per position (#1) */
+    int64_t disk_buf_cap;
 } KVState;
 
 typedef struct {
@@ -3971,36 +3974,73 @@ static void kv_hdr(Model *m, int32_t *h, int nrec){
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
     h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
 }
+/* Bytes of one on-disk record: [tok i32][Lc+Rc per layer][Ic per DSA layer].
+ * Layout matches what kv_disk_append writes and kv_disk_load reads. */
+static int64_t kv_rec_bytes(Model *m){
+    Cfg *c=&m->c;
+    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
+    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
+    return rec;
+}
+/* Open the persistent handle lazily; write the header if the file is new. After
+ * this returns successfully, k->disk_fp is valid for the engine's lifetime and
+ * positioned at end-of-header (nrec==0 case) or wherever the caller seeks. */
+static int kv_disk_open(Model *m){
+    KVState *k=m->kv;
+    if(k->disk_fp) return 1;
+    k->disk_fp=fopen(k->disk_path,"r+b");
+    if(!k->disk_fp){                       /* not there yet -> create + header */
+        k->disk_fp=fopen(k->disk_path,"wb");
+        if(!k->disk_fp) return 0;
+        int32_t h[8]; kv_hdr(m,h,0);
+        fwrite(KV_MAGIC,1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
+        fflush(k->disk_fp);
+        fclose(k->disk_fp);
+        k->disk_fp=fopen(k->disk_path,"r+b");   /* reopen r+b for append */
+        if(!k->disk_fp) return 0;
+    }
+    return 1;
+}
 static void kv_disk_truncate(Model *m, int nrec){
     if(!g_kvsave) return;
     KVState *k=m->kv;
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }  /* drop to shrink on disc */
     FILE *f=fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
     k->disk_nrec=nrec;
-    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
+    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
+    fflush(f); fclose(f);
 }
 static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
 static void kv_disk_append(Model *m, const int *hist, int len){
     KVState *k=m->kv;
     if(!g_kvsave || len<=k->disk_nrec) return;
     Cfg *c=&m->c;
-    FILE *f=fopen(k->disk_path,"r+b");
-    if(!f){ f=fopen(k->disk_path,"wb"); if(!f) return;
-        int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f); }
-    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
-    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
+    if(!kv_disk_open(m)) return;
+    FILE *f=k->disk_fp;
+    int64_t rec = kv_rec_bytes(m);
+    /* grow the contiguous staging buffer if the record is larger (#1 batching) */
+    if(rec > k->disk_buf_cap){
+        uint8_t *nb=realloc(k->disk_buf, rec);
+        if(!nb) return;                    /* OOM: skip this turn, retry next */
+        k->disk_buf=nb; k->disk_buf_cap=rec;
+    }
     fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
     for(int p=k->disk_nrec;p<len;p++){
-        int32_t tk=hist[p]; fwrite(&tk,4,1,f);
+        uint8_t *b=k->disk_buf;            /* pack token + every layer into one record */
+        *(int32_t*)b = hist[p]; b+=4;
         for(int i=0;i<c->n_layers;i++){
-            fwrite(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f);
-            fwrite(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f);
+            memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
+            memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
         }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
-            fwrite(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f);
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
+            memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
+        }
+        fwrite(k->disk_buf, 1, (size_t)rec, f);   /* one fwrite per position (was ~157) */
     }
     fflush(f);                                   /* dati prima, contatore poi */
-    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
+    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
+    fflush(f);                                   /* persist the counter too */
     k->disk_nrec=len;
 }
 static int kv_disk_load(Model *m, int *hist, int maxctx){
@@ -4055,6 +4095,8 @@ static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, in
 
 static void serve_ctx_free(Model *m, ServeCtx *s){
     KVState *k=&s->kv; int NR=m->c.n_layers+1;
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
+    free(k->disk_buf); k->disk_buf=NULL;
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
