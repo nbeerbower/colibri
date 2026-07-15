@@ -181,7 +181,9 @@ typedef struct {
     uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
     uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
-    double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
+    double t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (wall del
+                                                  * thread di compute; il servizio disco
+                                                  * overlappato vive in g_edisk_ns) */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
 } Model;
@@ -265,6 +267,14 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
  * every mode stays byte-identical. */
 static int g_prof=0;
 static _Atomic int64_t g_prof_io;                /* bytes pread()/faulted from expert files */
+/* Disk service: wall time inside expert_load on whichever thread runs the read
+ * (PIPE I/O workers, OMP loaders, the speculative pilot). It overlaps compute,
+ * so it is NOT a wall-time phase — the stall the compute thread actually felt
+ * is m->t_ewait. Thread-seconds, so it can exceed wall time under parallel
+ * reads; wait << service means overlap/parallelism is hiding the reads,
+ * wait ~ service means the loads block the compute thread. */
+static _Atomic int64_t g_edisk_ns;
+static double edisk_s(void){ return atomic_load_explicit(&g_edisk_ns,memory_order_relaxed)*1e-9; }
 #define PROF_LAT_CAP 32768
 static double g_prof_lat[PROF_LAT_CAP];          /* per-forward decode wall clock (ring) */
 static uint64_t g_prof_nlat;                     /* forwards recorded (monotonic) */
@@ -275,7 +285,7 @@ typedef struct {
     int64_t io; uint64_t hits,miss,ereq,n_fw,n_emit,nlat;
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
-    b->edisk=m->t_edisk; b->ewait=m->t_ewait; b->emm=m->t_emm;
+    b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
     b->attn=m->t_attn; b->head=m->t_head;
     b->io=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
     b->hits=m->hits; b->miss=m->miss; b->ereq=m->ereq;
@@ -1350,7 +1360,7 @@ static void *map_of_fd(int fd){
  * pread error aborts the process. fatal=0 (speculative pilot only): the same
  * errors instead abandon the load and return -1 without touching s->eid, so a
  * mispredicted cross-layer prefetch can never kill the server. */
-static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
+static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
@@ -1507,6 +1517,14 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; return 0;
+}
+/* Every expert read goes through here: time the whole load (pread/fault +
+ * bookkeeping) on the thread that runs it, into the disk-service counter. */
+static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
+    double t0=now_s();
+    int rc=expert_load_impl(m,layer,eid,s,fatal);
+    atomic_fetch_add_explicit(&g_edisk_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
+    return rc;
 }
 
 /* ============================ PIPE: load ‖ matmul ============================
@@ -2426,11 +2444,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 double t0=now_s();
                 int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
                 pipe_dispatch(m,layer,eids,nmiss);
-                m->t_edisk += now_s()-t0;           /* dispatch only; real reads hide behind matmul */
+                m->t_ewait += now_s()-t0;           /* dispatch only; the reads overlap matmul and
+                                                     * are timed as service inside expert_load */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
                 for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
-                m->t_edisk += now_s()-t0; }
+                m->t_ewait += now_s()-t0; }         /* compute thread blocked for the whole load */
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
@@ -2459,7 +2478,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * correct (and free) when a subset falls back to the CPU. */
             if(g_pipe && nmiss){ double tw=now_s();
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
-                m->t_edisk += now_s()-tw; }
+                m->t_ewait += now_s()-tw; }
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
             if(nbb>0){
                 double t0=now_s();
@@ -2483,7 +2502,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * Stays ABOVE the METAL skip: a subset that fell back to the CPU still needs its
              * slot drained here, and under METAL the block-level drain above already ran (this
              * spin is then a no-op). */
-            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk += now_s()-tw; }
+            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }
 #ifdef COLI_METAL
             /* skip the subsets already computed on GPU */
             if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
@@ -3581,7 +3600,7 @@ static void profile_print(Model *m, double elapsed){
     double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(including kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
-        m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+        edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
 #ifdef COLI_METAL
@@ -3596,8 +3615,9 @@ static void profile_print(Model *m, double elapsed){
 }
 
 static void profile_reset(Model *m){
-    m->t_edisk=m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
+    m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_aproj=m->t_acore=m->t_aout=0;
+    atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
 }
 
 /* PROF=1 report: forward-latency percentiles, expert I/O totals, phase shares
@@ -3630,17 +3650,19 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     double eb=(double)expert_bytes_probe(m,m->ebits);
     int pinned=0,lru=0;
     for(int i=0;i<=c->n_layers;i++){ if(m->npin)pinned+=m->npin[i]; if(m->ecn)lru+=m->ecn[i]; }
+    double io_w=m->t_ewait-b->ewait;    /* stall the compute thread felt */
+    double io_svc=edisk_s()-b->edisk;   /* read service on the loading threads (overlaps compute) */
     fprintf(f,"[PROF] expert I/O: %.3f GB fetched (%.1f MB/token, %.2f GB/s over the run%s) | "
-              "hit %.1f%% (%llu hit / %llu load) | %.1f loads/token\n",
+              "hit %.1f%% (%llu hit / %llu load) | %.1f loads/token | %.1fs read service / %.1fs felt wait\n",
         io/1e9, tokens>0?io/1e6/tokens:0.0, io/1e9/elapsed,
         g_mmap?"; COLI_MMAP=1: page cache may serve part":"",
-        hitp,(unsigned long long)dh,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0);
+        hitp,(unsigned long long)dh,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
+        io_svc,io_w);
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
         pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
-    double io_s=(m->t_edisk-b->edisk)+(m->t_ewait-b->ewait);
     double emm=m->t_emm-b->emm, attn=m->t_attn-b->attn, head=m->t_head-b->head;
-    double other=elapsed-io_s-emm-attn-head; if(other<0) other=0;
-    double f_io=io_s/elapsed, f_emm=emm/elapsed, f_attn=attn/elapsed;
+    double other=elapsed-io_w-emm-attn-head; if(other<0) other=0;
+    double f_io=io_w/elapsed, f_emm=emm/elapsed, f_attn=attn/elapsed;
     fprintf(f,"[PROF] time shares: expert-I/O %.0f%% | expert-matmul %.0f%% | attention %.0f%% | lm_head %.0f%% | other %.0f%%\n",
         100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*other/elapsed);
     if(f_io>=0.30){
@@ -4036,12 +4058,14 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     hits_emit(m);
     /* PROF: per-turn phase timings for the dashboard profiling page —
      * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw>".
-     * With KV_SLOTS>1 concurrent slots share the batched forwards, so the shares
-     * describe the whole engine over the window, not the single request (same
-     * convention as the STAT hit% below). */
+     * edisk = disk service (expert_load wall on the reading threads, overlaps
+     * compute); ewait = the stall the compute thread felt — only ewait belongs
+     * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
+     * batched forwards, so the shares describe the whole engine over the
+     * window, not the single request (same convention as the STAT hit% below). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
            r->prompt_tokens,r->emitted,
-           m->t_edisk-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
+           edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
            (unsigned long long)(m->n_fw-r->pb.n_fw));
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
