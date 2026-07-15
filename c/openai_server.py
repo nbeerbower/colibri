@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
+PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -470,6 +471,8 @@ class Engine:
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
+        self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
+        self.profile_seq = 0
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -547,6 +550,20 @@ class Engine:
                 elif kind == "HITS" and len(fields) == 4:
                     self.hits = fields[3]
                     self.hits_seq += 1
+                elif kind == "PROF" and len(fields) >= 10:
+                    # per-turn phase timings: where the engine spent this turn's wall time
+                    self.profile.append({
+                        "wall_s": float(fields[1]),
+                        "prompt_tokens": int(fields[2]),
+                        "completion_tokens": int(fields[3]),
+                        "expert_disk_s": float(fields[4]),
+                        "expert_wait_s": float(fields[5]),
+                        "expert_matmul_s": float(fields[6]),
+                        "attention_s": float(fields[7]),
+                        "lm_head_s": float(fields[8]),
+                        "forwards": int(fields[9]),
+                    })
+                    self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
@@ -777,6 +794,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/profile":
+                eng = self.server.engine
+                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
+                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):

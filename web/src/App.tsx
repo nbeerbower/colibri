@@ -31,6 +31,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
 import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
+import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 
@@ -69,7 +70,7 @@ export default function App() {
   const [totalTokens, setTotalTokens] = useState({ prompt: 0, completion: 0 })
   const [connecting, setConnecting] = useState(false)
   const [connected, setConnected] = useState(false)
-  const [view, setView] = useState<"chat" | "brain">("chat")
+  const [view, setView] = useState<"chat" | "brain" | "profiling">("chat")
   const [error, setError] = useState("")
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
@@ -310,6 +311,7 @@ export default function App() {
           <div className="view-tabs">
             <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}><MessageSquareText className="size-3.5" /> Chat</button>
             <button className={view === "brain" ? "active" : ""} onClick={() => setView("brain")}><BrainCircuit className="size-3.5" /> Brain</button>
+            <button className={view === "profiling" ? "active" : ""} onClick={() => setView("profiling")}><Gauge className="size-3.5" /> Profiling</button>
           </div>
           <div className="top-actions">
               {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {tokenCount} tokens</Badge> : null}
@@ -322,7 +324,8 @@ export default function App() {
             </div>
         </header>
 
-        {view === "brain" ? <Brain baseUrl={baseUrl} apiKey={apiKey} connected={connected} /> : <>
+        {view === "brain" ? <Brain baseUrl={baseUrl} apiKey={apiKey} connected={connected} />
+          : view === "profiling" ? <Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /> : <>
 
         <div className="conversation">
           {!messages.length ? (
