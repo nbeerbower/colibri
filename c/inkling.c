@@ -75,11 +75,17 @@ typedef struct {
     Wt sh_g, sh_u, sh_d;                  /* shared experts [ns][I,D] etc. */
 } Layer;
 
-/* ---------- routed-expert LRU cache ---------- */
+/* ---------- routed-expert cache: LRU + optional pinned set ----------
+ * Container snapshots keep the expert rows PACKED in RAM (int4 stays 4-bit:
+ * ~28 MB/expert instead of ~57 unpacked, so the same budget caches twice the
+ * experts); the matmul kernels unpack nibbles in-register. */
 typedef struct {
     int eid; uint64_t used;
-    int8_t *q13, *q2; float *s13, *s2;    /* bits>0: int-quantized rows */
-    float *f13, *f2;                      /* bits==0: raw f32 */
+    int pinned;                           /* never evicted (usage-history pin) */
+    int filled;                           /* 0 while queued for a parallel fill */
+    uint8_t *p13, *p2; float *s13, *s2;   /* container: packed rows + row scales */
+    int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
+    float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
@@ -92,6 +98,9 @@ typedef struct {
     float *embed_norm, *final_norm;
     Layer *L;
     LCache *cache;
+    int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
+    uint32_t **eusage;                    /* per-layer expert selection counts */
+    int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss;
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
@@ -235,6 +244,62 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
         const int8_t *w = q + (int64_t)o * I;
         float acc = 0.f;
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
+        y[o] = acc * scale[o];
+    }
+}
+
+/* y[1,O] = x @ W^T with W kept PACKED int4 (low nibble = even column, +8
+ * offset, per-row scale — the on-disk container layout, cached as-is).
+ * Nibbles unpack in-register: same numeric result as unpack-to-int8 +
+ * matmul_q, half the cache footprint. IDOT=0 keeps the byte-exact scalar. */
+static void matmul_q4(float *y, const float *x, const uint8_t *p, const float *scale, int I, int O) {
+#if defined(__AVX2__)
+    static int idot = -1;
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot && I % 32 == 0 && I <= 8192) {
+        int nb = I / 32;
+        int8_t xi[8192]; float xs[256];
+        for (int b = 0; b < nb; b++) {
+            const float *xb = x + b*32;
+            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
+            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
+            xs[b] = s; float inv = 1.f/s;
+            for (int i = 0; i < 32; i++) xi[b*32+i] = (int8_t)lrintf(xb[i]*inv);
+        }
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m256i b8 = _mm256_set1_epi8(8);
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *w = p + (int64_t)o * (I/2);
+            float acc = 0.f;
+            for (int b = 0; b < nb; b++) {
+                __m128i by = _mm_loadu_si128((const __m128i*)(w + b*16));  /* 16 B = 32 nibbles */
+                __m128i lo = _mm_and_si128(by, m4);                        /* even columns */
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);     /* odd columns  */
+                __m256i nib = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),  /* cols 16..31 */
+                                               _mm_unpacklo_epi8(lo, hi)); /* cols  0..15 */
+                nib = _mm256_sub_epi8(nib, b8);
+                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
+                                           _mm256_loadu_si256((const __m256i*)(xi + b*32)), nib);
+                __m128i l = _mm256_castsi256_si128(vacc), h = _mm256_extracti128_si256(vacc, 1);
+                __m128i s4 = _mm_add_epi32(l, h);
+                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
+                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
+            }
+            y[o] = acc * scale[o];
+        }
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = p + (int64_t)o * (I/2);
+        float acc = 0.f;
+        for (int i = 0; i < I; i += 2) {
+            uint8_t byte = w[i/2];
+            acc += x[i]   * (float)((int)(byte & 0xF) - 8);
+            acc += x[i+1] * (float)((int)(byte >> 4)  - 8);
+        }
         y[o] = acc * scale[o];
     }
 }
@@ -458,6 +523,8 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
     }
 }
 
+static double mem_avail_bytes(void);
+
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
@@ -508,73 +575,193 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             m->cs[j][i] = calloc((int64_t)C * (K-1), sizeof(float));
         }
     }
-    m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
-    /* container detection: converted snapshots store experts as U8 + .qs */
+    /* container detection: converted snapshots store experts as U8 + .qs.
+     * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
+    int64_t I = c->moe_inter, E = c->n_experts;
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
         st_tensor *t = st_find(&m->S, nm);
-        if (t) m->xq = (t->dtype == 3);
+        if (t && t->dtype == 3) {
+            m->xq = 1;
+            m->rb13 = t->nbytes / (E * 2*I);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",i);
+            st_tensor *t2 = st_find(&m->S, nm);
+            m->rb2 = t2->nbytes / (E * (int64_t)D);
+            if (m->rb13 != D && m->rb13*2 != D) { fprintf(stderr,"unsupported container row size %lld\n",(long long)m->rb13); exit(1); }
+        }
         break;
     }
+    int nsp = 0; for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
+    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
+                  : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    if (cap <= 0) {   /* auto: fit the LRU in available RAM, 20% + 4 GB headroom */
+        double avail = mem_avail_bytes();
+        cap = avail > 0 ? (int)((avail*0.80 - 4e9) / ((double)slotb * (nsp ? nsp : 1))) : 16;
+        if (cap < 4) cap = 4;
+        if (cap > c->n_experts) cap = c->n_experts;
+        fprintf(stderr, "[cap auto] %d experts/layer (%.1f GB cache budget)\n",
+                cap, (double)cap*slotb*nsp/1e9);
+    }
+    m->cache = calloc(c->n_layers, sizeof(LCache));
+    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    /* usage counters; seeded from a previous run's history when present */
+    m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
     m->dense_load_s = now_s() - t0;
 }
 
-/* ---------- routed-expert fetch: slice of fused tensors, LRU-cached ---------- */
-static void expert_get(Model *m, int layer, int eid, Slot **out) {
+static double mem_avail_bytes(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char ln[256]; double kb = 0;
+    while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
+    fclose(f);
+    return kb * 1024.0;
+#else
+    return 0;
+#endif
+}
+
+/* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
+static Slot *slot_find(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i]; return;
+        lc->slots[i].used = ++m->clock;
+        return &lc->slots[i];
     }
-    m->miss++;
-    Cfg *c = &m->c;
-    int64_t D = c->hidden, I = c->moe_inter;
-    int64_t n13 = 2*I*D, n2 = D*I;
+    return NULL;
+}
+
+/* allocate a slot (or evict the LRU non-pinned one); serial callers only */
+static Slot *slot_acquire(Model *m, int layer, int eid) {
+    LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
+    int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     Slot *s;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        if (m->quant_bits || m->xq) {
-            s->q13 = malloc(n13); s->q2 = malloc(n2);
-            s->s13 = falloc(2*I); s->s2 = falloc(D);
-        } else { s->f13 = falloc(n13); s->f2 = falloc(n2); }
-    } else { int lru = 0; for (int i = 1; i < lc->n; i++) if (lc->slots[i].used < lc->slots[lru].used) lru = i; s = &lc->slots[lru]; }
+        if (m->xq)              { s->p13 = malloc((size_t)(m->rb13*2*I)); s->p2 = malloc((size_t)(m->rb2*D));
+                                  s->s13 = falloc(2*I); s->s2 = falloc(D);
+                                  if (!s->p13 || !s->p2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
+        else if (m->quant_bits) { s->q13 = malloc(n13); s->q2 = malloc(n2);
+                                  s->s13 = falloc(2*I); s->s2 = falloc(D);
+                                  if (!s->q13 || !s->q2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
+        else                    { s->f13 = falloc(n13); s->f2 = falloc(n2); }
+    } else {
+        int lru = -1;
+        for (int i = 0; i < lc->n; i++)
+            if (!lc->slots[i].pinned && (lru < 0 || lc->slots[i].used < lc->slots[lru].used)) lru = i;
+        if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
+        s = &lc->slots[lru];
+    }
+    s->eid = eid; s->used = ++m->clock; s->filled = 0; s->pinned = 0;
+    return s;
+}
+
+/* pure I/O (+ optional requant): safe to run in parallel across slots */
+static void slot_fill(Model *m, int layer, Slot *s) {
+    Cfg *c = &m->c;
+    int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
+    int64_t eid = s->eid;
     char nm[320], qs[340];
     if (m->xq) {
-        /* colibri container: packed U8 rows + f32 row scales, raw read, no requant */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
-        st_tensor *t = st_find(&m->S, nm);
-        int64_t rowb = t->nbytes / ((int64_t)c->n_experts * 2*I);   /* D = int8, D/2 = int4 */
-        uint8_t *raw = malloc((size_t)(2*I*rowb));
-        read_u8_slice(&m->S, nm, raw, (int64_t)eid*2*I*rowb, 2*I*rowb);
-        unpack_rows(raw, s->q13, 2*I, D, rowb);
+        read_u8_slice(&m->S, nm, s->p13, eid*2*I*m->rb13, 2*I*m->rb13);
         snprintf(qs,sizeof(qs),"%s.qs",nm);
-        read_f32_slice(&m->S, qs, s->s13, (int64_t)eid*2*I, 2*I);
+        read_f32_slice(&m->S, qs, s->s13, eid*2*I, 2*I);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
-        t = st_find(&m->S, nm);
-        rowb = t->nbytes / ((int64_t)c->n_experts * D);
-        raw = realloc(raw, (size_t)(D*rowb));
-        read_u8_slice(&m->S, nm, raw, (int64_t)eid*D*rowb, D*rowb);
-        unpack_rows(raw, s->q2, D, I, rowb);
+        read_u8_slice(&m->S, nm, s->p2, eid*D*m->rb2, D*m->rb2);
         snprintf(qs,sizeof(qs),"%s.qs",nm);
-        read_f32_slice(&m->S, qs, s->s2, (int64_t)eid*D, D);
-        free(raw);
+        read_f32_slice(&m->S, qs, s->s2, eid*D, D);
     } else if (m->quant_bits) {
         float *tmp = falloc(n13 > n2 ? n13 : n2);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
-        read_f32_slice(&m->S, nm, tmp, (int64_t)eid*n13, n13);
+        read_f32_slice(&m->S, nm, tmp, eid*n13, n13);
         quantize_rows(tmp, s->q13, s->s13, 2*I, D, m->quant_bits);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
-        read_f32_slice(&m->S, nm, tmp, (int64_t)eid*n2, n2);
+        read_f32_slice(&m->S, nm, tmp, eid*n2, n2);
         quantize_rows(tmp, s->q2, s->s2, D, I, m->quant_bits);
         free(tmp);
     } else {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
-        read_f32_slice(&m->S, nm, s->f13, (int64_t)eid*n13, n13);
+        read_f32_slice(&m->S, nm, s->f13, eid*n13, n13);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
-        read_f32_slice(&m->S, nm, s->f2, (int64_t)eid*n2, n2);
+        read_f32_slice(&m->S, nm, s->f2, eid*n2, n2);
     }
-    s->eid = eid; s->used = ++m->clock;
-    *out = s;
+    s->filled = 1;
+}
+
+/* pin the top-N experts per sparse layer from a usage-history file (colibri
+ * .coli_usage convention: one uint32 count per expert per layer). Pins are
+ * regular cache slots flagged non-evictable, filled in parallel at startup. */
+static void pins_load(Model *m, const char *snap) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    char up[2048];
+    const char *env = getenv("PIN");
+    if (env) snprintf(up, sizeof(up), "%s", env);
+    else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
+    FILE *f = fopen(up, "rb");
+    if (!f) return;
+    uint32_t hdr[3];
+    if (fread(hdr, 4, 3, f) != 3 || hdr[0] != 0x31554B49u ||
+        (int)hdr[1] != c->n_layers || (int)hdr[2] != E) {
+        fprintf(stderr, "[pin] %s: not an inkling usage file, ignoring\n", up);
+        fclose(f); return;
+    }
+    int cap = m->cache[0].cap;
+    m->npin = getenv("PIN_N") ? atoi(getenv("PIN_N")) : cap/4;
+    if (m->npin > cap - 8) m->npin = cap - 8;
+    if (m->npin < 0) m->npin = 0;
+    uint32_t *tmp = malloc((size_t)E * 4);
+    Slot **ps = malloc((size_t)c->n_layers * m->npin * sizeof(Slot*));
+    int *pl = malloc((size_t)c->n_layers * m->npin * sizeof(int));
+    int np = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (fread(tmp, 4, E, f) != (size_t)E) break;
+        if (!c->sparse[i] || !m->npin) continue;
+        memcpy(m->eusage[i], tmp, (size_t)E * 4);          /* seed the ranking */
+        for (int r = 0; r < m->npin; r++) {                /* top-N selection */
+            int best = -1; uint32_t bv = 0;
+            for (int e = 0; e < E; e++) {
+                int taken = 0;
+                for (int z = 0; z < r; z++) if (ps[np-r+z]->eid == e) { taken = 1; break; }
+                if (!taken && tmp[e] >= bv && tmp[e] > 0) { bv = tmp[e]; best = e; }
+            }
+            if (best < 0) break;
+            Slot *s = slot_acquire(m, i, best);
+            s->pinned = 1;
+            ps[np] = s; pl[np] = i; np++;
+        }
+    }
+    fclose(f);
+    if (np) {
+        double t0 = now_s();
+        #pragma omp parallel for schedule(dynamic,1)
+        for (int j = 0; j < np; j++) slot_fill(m, pl[j], ps[j]);
+        fprintf(stderr, "[pin] %d experts pinned (%d/layer) from %s in %.1fs\n",
+                np, m->npin, up, now_s()-t0);
+    }
+    free(tmp); free(ps); free(pl);
+}
+
+/* usage snapshot: rewritten after every generation run (same contract as
+ * glm's .coli_usage — copy it aside if you need a stable ranking) */
+static void usage_save(Model *m, const char *snap) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    char up[2048], tp[2060];
+    const char *env = getenv("PIN");
+    if (env) snprintf(up, sizeof(up), "%s", env);
+    else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
+    snprintf(tp, sizeof(tp), "%s.tmp", up);
+    FILE *f = fopen(tp, "wb");
+    if (!f) return;
+    uint32_t hdr[3] = { 0x31554B49u, (uint32_t)c->n_layers, (uint32_t)E };
+    fwrite(hdr, 4, 3, f);
+    uint32_t *zero = calloc(E, 4);
+    for (int i = 0; i < c->n_layers; i++)
+        fwrite(m->eusage[i] ? m->eusage[i] : zero, 4, E, f);
+    free(zero); fclose(f);
+    rename(tp, up);
 }
 
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
@@ -668,7 +855,11 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     free(g); free(u);
 }
 
-/* ---------- MoE: sigmoid router + bias top-k, joint routed+shared weights ---------- */
+/* ---------- MoE: sigmoid router + bias top-k, joint routed+shared weights ----------
+ * Three passes per layer call: (1) route every position and acquire slots,
+ * (2) fill ALL missing experts in one parallel burst (the NVMe wants queue
+ * depth — during prefill this batches the whole sequence's misses), then
+ * (3) compute. */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter, ns = c->n_shared;
@@ -676,41 +867,82 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *logits = falloc((int64_t)S*ET);
     matmul(logits, x, l->router, S, D, ET);
     memset(out, 0, (int64_t)S*D*sizeof(float));
-    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    int   *idx  = malloc((size_t)S*K*sizeof(int));
+    float *wgt  = malloc((size_t)S*(K+ns)*sizeof(float));
+    Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
+    Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
+    int  *fl    = malloc((size_t)S*K*sizeof(int));
+    int nfill = 0;
+    /* pass 1: routing + slot bookkeeping (serial) */
     for (int s = 0; s < S; s++) {
         float *lg = logits + (int64_t)s*ET;
+        int *si = idx + (int64_t)s*K;
         /* selection: sigmoid(routed) + correction bias, top-K */
-        int idx[64];
         for (int kk = 0; kk < K; kk++) {
             int best = -1; float bv = -1e30f;
             for (int e = 0; e < E; e++) {
-                int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+                int taken = 0; for (int j = 0; j < kk; j++) if (si[j]==e){taken=1;break;}
                 float ch = sigmoidf(lg[e]) + l->rbias[e];
                 if (!taken && ch > bv) { bv = ch; best = e; }
             }
-            idx[kk] = best;
+            si[kk] = best;
         }
         /* combine weights: sigmoids of the raw logits of (topK routed + shared),
          * normalized to sum 1 over all K+ns, x route_scale x gate.global_scale */
-        float w[80]; float sum = 0.f;
-        for (int kk = 0; kk < K; kk++)  { w[kk]   = sigmoidf(lg[idx[kk]]); sum += w[kk]; }
-        for (int j = 0; j < ns; j++)    { w[K+j]  = sigmoidf(lg[E+j]);     sum += w[K+j]; }
+        float *w = wgt + (int64_t)s*(K+ns); float sum = 0.f;
+        for (int kk = 0; kk < K; kk++)  { w[kk]   = sigmoidf(lg[si[kk]]); sum += w[kk]; }
+        for (int j = 0; j < ns; j++)    { w[K+j]  = sigmoidf(lg[E+j]);    sum += w[K+j]; }
         for (int kk = 0; kk < K+ns; kk++) w[kk] *= c->route_scale * l->rgs / sum;
+        for (int kk = 0; kk < K; kk++) {
+            int eid = si[kk];
+            if (m->eusage[layer]) m->eusage[layer][eid]++;
+            Slot *e = slot_find(m, layer, eid);
+            if (e) m->hits++;
+            else {
+                m->miss++;
+                e = slot_acquire(m, layer, eid);
+                fill[nfill] = e; fl[nfill] = layer; nfill++;
+            }
+            use[(int64_t)s*K + kk] = e;
+        }
+    }
+    /* pass 2: one parallel burst for every miss in this layer call */
+    if (nfill) {
+        #pragma omp parallel for schedule(dynamic,1)
+        for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+    }
+    /* pass 3: compute */
+    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
+    for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s*D;
         float *os = out + (int64_t)s*D;
+        float *w = wgt + (int64_t)s*(K+ns);
         for (int kk = 0; kk < K; kk++) {
-            Slot *e; expert_get(m, layer, idx[kk], &e);
-            int qm = m->quant_bits || m->xq;
-            if (qm) {
-                matmul_q(g, xs, e->q13,                 e->s13,     D, I);   /* gate rows  */
-                matmul_q(u, xs, e->q13 + (int64_t)I*D,  e->s13 + I, D, I);   /* up rows    */
+            Slot *e = use[(int64_t)s*K + kk];
+            if (m->xq) {
+                if (q4) {
+                    matmul_q4(g, xs, e->p13,                    e->s13,     D, I);   /* gate rows */
+                    matmul_q4(u, xs, e->p13 + (int64_t)I*m->rb13, e->s13 + I, D, I); /* up rows   */
+                    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                    matmul_q4(hh, g, e->p2, e->s2, I, D);
+                } else {
+                    matmul_q(g, xs, (int8_t*)e->p13,                 e->s13,     D, I);
+                    matmul_q(u, xs, (int8_t*)e->p13 + (int64_t)I*D,  e->s13 + I, D, I);
+                    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                    matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
+                }
+            } else if (m->quant_bits) {
+                matmul_q(g, xs, e->q13,                 e->s13,     D, I);
+                matmul_q(u, xs, e->q13 + (int64_t)I*D,  e->s13 + I, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                matmul_q(hh, g, e->q2, e->s2, I, D);
             } else {
                 matmul(g, xs, e->f13,                1, D, I);
                 matmul(u, xs, e->f13 + (int64_t)I*D, 1, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                matmul(hh, g, e->f2, 1, I, D);
             }
-            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            if (qm) matmul_q(hh, g, e->q2, e->s2, I, D);
-            else matmul(hh, g, e->f2, 1, I, D);
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
         /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
@@ -722,7 +954,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
         }
     }
-    free(logits); free(g); free(u); free(hh);
+    free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
+    free(g); free(u); free(hh);
 }
 
 /* ---------- one forward pass over S new tokens ----------
@@ -851,7 +1084,7 @@ int main(int argc, char **argv) {
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
     const char *prompt = NULL, *refpath = "ref_inkling.json";
-    int cap = 16, bits = 0, n_new = 256, npos = 0;
+    int cap = -1, bits = 0, n_new = 256, npos = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
@@ -859,15 +1092,22 @@ int main(int argc, char **argv) {
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
     }
+    if (cap < 0) cap = prompt ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
 
     if (prompt) {
         Model m; model_init(&m, snap, cap, bits);
         printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
-               m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", cap);
+               m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", m.cache[0].cap);
+        pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
         generate_stream(&m, &T, prompt, n_new);
+        usage_save(&m, snap);
+        double tot = m.hits + m.miss;
+        printf("[cache] hit %.1f%% (%llu hit / %llu load) | usage history saved\n",
+               tot ? 100.0*m.hits/tot : 0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
         return 0;
     }
 
