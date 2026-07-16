@@ -745,7 +745,10 @@ static void pins_load(Model *m, const char *snap) {
         fclose(f); return;
     }
     int cap = m->cache[0].cap;
-    m->npin = getenv("PIN_N") ? atoi(getenv("PIN_N")) : cap/4;
+    /* default: pin half the cap. Measured on the 975B: cap/4 (19/layer) gave
+     * 83.6% hit / 0.32 tok/s; 40/layer gave 95.6% / 0.80 tok/s — decode fills
+     * run at queue depth ~1, so every pinned expert removes a ~35ms stall. */
+    m->npin = getenv("PIN_N") ? atoi(getenv("PIN_N")) : cap/2;
     if (m->npin > cap - 8) m->npin = cap - 8;
     if (m->npin < 0) m->npin = 0;
     uint32_t *tmp = malloc((size_t)E * 4);
