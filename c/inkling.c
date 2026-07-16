@@ -729,11 +729,18 @@ static void slot_fill(Model *m, int layer, Slot *s) {
 
 /* pin the top-N experts per sparse layer from a usage-history file (colibri
  * .coli_usage convention: one uint32 count per expert per layer). Pins are
- * regular cache slots flagged non-evictable, filled in parallel at startup. */
+ * regular cache slots flagged non-evictable, filled in parallel at startup.
+ * Toggles: PIN=off (or PIN=0) skips cache warming entirely (no seeding, no
+ * pins, cold LRU start); PIN_N=0 seeds the ranking from the history but pins
+ * nothing; PIN=<path> uses an alternate history file; PIN_N=<n> pin depth. */
 static void pins_load(Model *m, const char *snap) {
     Cfg *c = &m->c; int E = c->n_experts;
     char up[2048];
     const char *env = getenv("PIN");
+    if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) {
+        fprintf(stderr, "[pin] cache warming disabled (PIN=%s)\n", env);
+        return;
+    }
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
     FILE *f = fopen(up, "rb");
@@ -784,11 +791,16 @@ static void pins_load(Model *m, const char *snap) {
 }
 
 /* usage snapshot: rewritten after every generation run (same contract as
- * glm's .coli_usage — copy it aside if you need a stable ranking) */
+ * glm's .coli_usage — copy it aside if you need a stable ranking).
+ * USAGE_SAVE=0 skips the rewrite (e.g. benchmark loops that would skew the
+ * ranking); PIN=off also implies no save (that run never seeded counts). */
 static void usage_save(Model *m, const char *snap) {
     Cfg *c = &m->c; int E = c->n_experts;
     char up[2048], tp[2060];
     const char *env = getenv("PIN");
+    const char *sv = getenv("USAGE_SAVE");
+    if (sv && *sv == '0') return;
+    if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
     snprintf(tp, sizeof(tp), "%s.tmp", up);
