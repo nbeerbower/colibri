@@ -1,0 +1,770 @@
+/* Pure-C inference engine for Thinking Machines "Inkling" (text-only), Stage A.
+ * Goal, like olmoe.c before GLM-5.2: reproduce the EXACT token ids of the HF
+ * transformers reference (ref_inkling.json from tools/make_tiny_inkling.py)
+ * to validate the core math before scaling to the 975B checkpoint.
+ *
+ * Architecture (vs glm.c's MLA/RoPE/DSA — shares almost nothing):
+ *  - hybrid attention: sliding-window layers (window=512, 16 KV heads) and
+ *    global layers (8 KV heads) interleaved 5:1; conventional GQA, no RoPE
+ *  - learned relative-position bias: r_proj(x) mixes a per-layer bank
+ *    proj[d_rel, rel_extent] into one bias per backward distance
+ *  - log-length scaling tau on global layers past n_floor tokens
+ *  - depthwise-causal short convs (kernel 4, residual inside, fp32):
+ *    on K and V inside attention, after attention, and after the MLP
+ *  - MoE: sigmoid router + loss-free bias for top-k selection; combine
+ *    weights are sigmoids of the raw logits jointly normalized over
+ *    topk routed + n_shared shared experts, x route_scale x global_scale
+ *  - logits: hidden / logits_mup_width_multiplier, sliced to unpadded vocab
+ *
+ * Dense weights (attn, norms, convs, router, shared experts, dense MLP)
+ * resident in RAM as f32; routed experts streamed from disk per-expert out
+ * of the fused [E, 2I, D] / [E, D, I] tensors, LRU-cached, optionally
+ * int-quantized (bits=0 keeps them f32 for bit-exact oracle validation).
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/resource.h>
+#endif
+#include "st.h"
+#include "tok.h"
+
+#define MAXL 256
+
+/* ---------- config ---------- */
+typedef struct {
+    int hidden, n_layers, vocab, unpad_vocab;
+    int n_heads, n_kv, head_dim;          /* global ("hybrid") layers */
+    int swa_heads, swa_kv, swa_hd;        /* sliding ("hybrid_sliding") layers */
+    int window, d_rel, rel_extent, conv_k;
+    double log_floor;                     /* <=0: log scaling off */
+    float log_alpha;
+    int n_experts, topk, n_shared, moe_inter, dense_inter;
+    int eos;
+    float eps, route_scale, mup;
+    unsigned char local[MAXL];            /* 1 = sliding-window layer */
+    unsigned char sparse[MAXL];           /* 1 = MoE layer, 0 = dense MLP */
+} Cfg;
+
+/* per-layer dims that depend on the attention type */
+#define L_HEADS(c,i) ((c)->local[i] ? (c)->swa_heads : (c)->n_heads)
+#define L_KV(c,i)    ((c)->local[i] ? (c)->swa_kv    : (c)->n_kv)
+#define L_HD(c,i)    ((c)->local[i] ? (c)->swa_hd    : (c)->head_dim)
+#define L_EXT(c,i)   ((c)->local[i] ? (c)->window    : (c)->rel_extent)
+
+/* ---------- resident per-layer weights (f32) ---------- */
+typedef struct {
+    float *in_ln, *post_ln;
+    float *q, *k, *v, *r, *o;             /* projections */
+    float *qn, *kn;                       /* per-head rmsnorm [head_dim] */
+    float *relp;                          /* [d_rel, ext] bias bank */
+    float *k_cw, *v_cw, *a_cw, *m_cw;     /* sconv weights, [C*K] depthwise */
+    /* dense layers */
+    float *dg, *du, *dd, dgs;
+    /* MoE layers */
+    float *router, *rbias, rgs;           /* [E+ns, D], [E], scalar */
+    float *sh_g, *sh_u, *sh_d;            /* shared experts [ns][I,D] etc. */
+} Layer;
+
+/* ---------- routed-expert LRU cache ---------- */
+typedef struct {
+    int eid; uint64_t used;
+    int8_t *q13, *q2; float *s13, *s2;    /* bits>0: int-quantized rows */
+    float *f13, *f2;                      /* bits==0: raw f32 */
+} Slot;
+typedef struct { Slot *slots; int n, cap; } LCache;
+
+typedef struct {
+    Cfg c;
+    shards S;
+    int quant_bits;                       /* 0 = f32 experts (oracle mode) */
+    int xq;                               /* experts on disk are a colibri container (U8 + .qs) */
+    float *embed, *embed_norm, *lm_head, *final_norm;
+    Layer *L;
+    LCache *cache;
+    uint64_t clock, hits, miss;
+    float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
+    float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
+    double dense_load_s;
+} Model;
+
+/* ---------- utility ---------- */
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
+#if defined(__APPLE__)
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
+#else
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
+#endif
+static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
+static float siluf(float x) { return x / (1.f + expf(-x)); }
+
+/* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
+static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *w = W + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
+            y[(int64_t)s * O + o] = acc;
+        }
+    }
+}
+
+/* y[1,O] = x @ q^T with per-row int quantization (same container math as olmoe.c) */
+static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        float acc = 0.f;
+        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
+        y[o] = acc * scale[o];
+    }
+}
+
+static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
+    int qmax = (1 << (bits - 1)) - 1;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *wr = w + (int64_t)o * I;
+        float amax = 0.f; for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
+        float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
+        scale[o] = s;
+        int8_t *qr = q + (int64_t)o * I;
+        for (int i = 0; i < I; i++) {
+            int v = (int)lrintf(wr[i] / s);
+            if (v >  qmax) v =  qmax;
+            if (v < -qmax-1) v = -qmax-1;
+            qr[i] = (int8_t)v;
+        }
+    }
+}
+
+/* rmsnorm computed in f64 accumulate like the f32->f32 reference */
+static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
+    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    for (int i = 0; i < D; i++) out[i] = x[i] * r * w[i];
+}
+
+static void softmax_row(float *x, int n) {
+    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
+    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* ---------- depthwise causal short conv, residual inside (fp32) ----------
+ * seq[S,C] in-place: out[t] = sum_j w[c,j]*in[t+j-(K-1)] + in[t], history from
+ * state[C*(K-1)] (raw pre-conv inputs), which is updated to the new tail. */
+static void sconv_apply(float *seq, int S, int C, const float *w, float *state, int K) {
+    int P = K - 1;
+    #pragma omp parallel
+    {
+        float *col = malloc((P + S) * sizeof(float));
+        #pragma omp for schedule(static)
+        for (int ch = 0; ch < C; ch++) {
+            for (int j = 0; j < P; j++) col[j] = state[(int64_t)ch*P + j];
+            for (int t = 0; t < S; t++) col[P + t] = seq[(int64_t)t*C + ch];
+            const float *wc = w + (int64_t)ch*K;
+            for (int t = 0; t < S; t++) {
+                float acc = 0.f;
+                for (int j = 0; j < K; j++) acc += wc[j] * col[t + j];
+                seq[(int64_t)t*C + ch] = acc + col[P + t];
+            }
+            for (int j = 0; j < P; j++) state[(int64_t)ch*P + j] = col[S + j];
+        }
+        free(col);
+    }
+}
+
+/* ---------- config loading ----------
+ * Accepts both the flat text config (tiny oracle via InklingForCausalLM) and
+ * the full multimodal config.json (real checkpoint, fields under text_config). */
+static double jnum(jval *o, const char *k, double dflt) {
+    jval *v = json_get(o, k);
+    return (v && v->t == J_NUM) ? v->num : dflt;
+}
+
+static void load_cfg(Cfg *c, const char *snap) {
+    char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
+    FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    char *arena=NULL; jval *root = json_parse(buf, &arena);
+    jval *r = json_get(root, "text_config"); if (!r) r = root;
+
+    c->hidden      = (int)jnum(r,"hidden_size",6144);
+    c->n_layers    = (int)jnum(r,"num_hidden_layers",66);
+    c->vocab       = (int)jnum(r,"vocab_size",201024);
+    c->unpad_vocab = (int)jnum(r,"unpadded_vocab_size",c->vocab);
+    c->n_heads     = (int)jnum(r,"num_attention_heads",64);
+    c->n_kv        = (int)jnum(r,"num_key_value_heads",8);
+    c->head_dim    = (int)jnum(r,"head_dim",128);
+    c->swa_heads   = (int)jnum(r,"swa_num_attention_heads",c->n_heads);
+    c->swa_kv      = (int)jnum(r,"swa_num_key_value_heads",16);
+    c->swa_hd      = (int)jnum(r,"swa_head_dim",c->head_dim);
+    c->window      = (int)jnum(r,"sliding_window_size",512);
+    c->d_rel       = (int)jnum(r,"d_rel",16);
+    c->rel_extent  = (int)jnum(r,"rel_extent",1024);
+    c->log_floor   = jnum(r,"log_scaling_n_floor",0);
+    c->log_alpha   = (float)jnum(r,"log_scaling_alpha",0.1);
+    c->conv_k      = (int)jnum(r,"sconv_kernel_size", jnum(r,"conv_kernel_size",4));
+    c->n_experts   = (int)jnum(r,"n_routed_experts",256);
+    c->topk        = (int)jnum(r,"num_experts_per_tok",6);
+    c->n_shared    = (int)jnum(r,"n_shared_experts",2);
+    c->eps         = (float)jnum(r,"rms_norm_eps",1e-6);
+    c->route_scale = (float)jnum(r,"route_scale",8.0);
+    c->mup         = (float)jnum(r,"logits_mup_width_multiplier",24.0);
+    /* eos lives at the top level in the real multimodal config, in the text
+     * config for a flat snapshot; may be null (tiny oracle) */
+    jval *eo = json_get(root,"eos_token_id");
+    if (!eo || eo->t != J_NUM) eo = json_get(r,"eos_token_id");
+    c->eos = (eo && eo->t == J_NUM) ? (int)eo->num : -1;
+    /* real config.json: intermediate_size = MoE, dense_intermediate_size = dense.
+     * HF-saved config (post_init applied): intermediate_size = dense, moe_intermediate_size = MoE. */
+    jval *dis = json_get(r,"dense_intermediate_size");
+    if (dis && dis->t == J_NUM) {
+        c->dense_inter = (int)dis->num;
+        c->moe_inter   = (int)jnum(r,"intermediate_size",3072);
+    } else {
+        c->dense_inter = (int)jnum(r,"intermediate_size",24576);
+        c->moe_inter   = (int)jnum(r,"moe_intermediate_size",3072);
+    }
+    if (c->n_layers > MAXL) { fprintf(stderr,"n_layers %d > MAXL\n", c->n_layers); exit(1); }
+
+    /* attention layer types: explicit layer_types[] > local_layer_ids[] > (i+1)%6 rule */
+    jval *lt = json_get(r,"layer_types");
+    jval *ll = json_get(r,"local_layer_ids");
+    for (int i = 0; i < c->n_layers; i++) {
+        if (lt && lt->t == J_ARR) c->local[i] = (strcmp(lt->kids[i]->str,"hybrid_sliding")==0);
+        else if (ll && ll->t == J_ARR) {
+            c->local[i] = 0;
+            for (int j = 0; j < ll->len; j++) if ((int)ll->kids[j]->num == i) { c->local[i] = 1; break; }
+        } else c->local[i] = ((i + 1) % 6) != 0;
+    }
+    /* MLP types: explicit mlp_layer_types[] > dense_mlp_idx (first k layers dense) */
+    jval *mt = json_get(r,"mlp_layer_types");
+    int dense_idx = (int)jnum(r,"dense_mlp_idx",0);
+    for (int i = 0; i < c->n_layers; i++) {
+        if (mt && mt->t == J_ARR) c->sparse[i] = (strcmp(mt->kids[i]->str,"sparse")==0);
+        else c->sparse[i] = (i >= dense_idx);
+    }
+    free(buf); free(arena);
+}
+
+/* ---------- weight loading ---------- */
+static float *load_t(Model *m, const char *name) {
+    int64_t n = st_numel(&m->S, name);
+    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    float *p = falloc(n);
+    st_read_f32(&m->S, name, p, 0);
+    return p;
+}
+static float load_scalar(Model *m, const char *name, float dflt) {
+    if (!st_has(&m->S, name)) return dflt;
+    float v; st_read_f32(&m->S, name, &v, 0); return v;
+}
+
+/* f32 slice of a (possibly bf16/f16) tensor: element offset + count.
+ * Needed to stream one expert out of the fused [E,2I,D]/[E,D,I] tensors. */
+static void read_f32_slice(shards *S, const char *name, float *out, int64_t off, int64_t cnt) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->dtype == 3) { fprintf(stderr, "%s: U8 container has no f32 view\n", name); exit(1); }
+    int esz = (t->dtype == 2) ? 4 : 2;
+    void *raw = malloc((size_t)cnt * esz);
+    if (!raw) { fprintf(stderr,"OOM slice %s\n",name); exit(1); }
+    if (pread(t->fd, raw, (size_t)cnt*esz, t->off + off*esz) != (ssize_t)(cnt*esz)) { perror("pread slice"); exit(1); }
+    if (t->dtype == 2) memcpy(out, raw, (size_t)cnt*4);
+    else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < cnt; i++) out[i] = bf16_to_f32(p[i]); }
+    else                    { uint16_t *p = raw; for (int64_t i = 0; i < cnt; i++) out[i] = f16_to_f32(p[i]); }
+    free(raw);
+    posix_fadvise(t->fd, t->off + off*esz, cnt*esz, POSIX_FADV_DONTNEED);
+}
+
+/* raw byte slice of a U8 container tensor */
+static void read_u8_slice(shards *S, const char *name, uint8_t *out, int64_t boff, int64_t nb) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (pread(t->fd, out, (size_t)nb, t->off + boff) != (ssize_t)nb) { perror("pread u8 slice"); exit(1); }
+    posix_fadvise(t->fd, t->off + boff, nb, POSIX_FADV_DONTNEED);
+}
+
+/* container rows -> int8: rowb==cols is int8 verbatim; rowb==cols/2 is packed
+ * int4 (low nibble = even column, offset +8 — convert_inkling_int4.py / glm.c) */
+static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t cols, int64_t rowb) {
+    if (rowb == cols) { memcpy(q, raw, (size_t)(rows*cols)); return; }
+    if (rowb*2 != cols) { fprintf(stderr, "container row size %ld vs cols %ld unsupported\n", (long)rowb, (long)cols); exit(1); }
+    for (int64_t r = 0; r < rows; r++) {
+        const uint8_t *b = raw + r*rowb;
+        int8_t *qr = q + r*cols;
+        for (int64_t j = 0; j < rowb; j++) {
+            qr[2*j]   = (int8_t)((b[j] & 0xF) - 8);
+            qr[2*j+1] = (int8_t)((b[j] >> 4) - 8);
+        }
+    }
+}
+
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    memset(m, 0, sizeof(*m));
+    m->quant_bits = bits;
+    load_cfg(&m->c, snap);
+    st_init(&m->S, snap);
+    Cfg *c = &m->c;
+    int D = c->hidden, K = c->conv_k;
+    double t0 = now_s();
+    m->embed      = load_t(m, "model.embed_tokens.weight");
+    m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+    m->final_norm = load_t(m, "model.norm.weight");
+    m->lm_head    = load_t(m, "lm_head.weight");
+    m->L = calloc(c->n_layers, sizeof(Layer));
+    char nm[320];
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
+        LD(in_ln,  "input_layernorm.weight");
+        LD(post_ln,"post_attention_layernorm.weight");
+        LD(q, "self_attn.q_proj.weight"); LD(k, "self_attn.k_proj.weight");
+        LD(v, "self_attn.v_proj.weight"); LD(r, "self_attn.r_proj.weight");
+        LD(o, "self_attn.o_proj.weight");
+        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
+        LD(relp, "self_attn.rel_logits_proj.proj");
+        LD(k_cw, "self_attn.k_sconv.conv1d.weight");
+        LD(v_cw, "self_attn.v_sconv.conv1d.weight");
+        LD(a_cw, "attn_sconv.conv1d.weight");
+        LD(m_cw, "mlp_sconv.conv1d.weight");
+        if (!c->sparse[i]) {
+            LD(dg, "mlp.gate_proj.weight"); LD(du, "mlp.up_proj.weight"); LD(dd, "mlp.down_proj.weight");
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.global_scale",i); l->dgs = load_scalar(m,nm,1.f);
+        } else {
+            LD(router, "mlp.gate.weight");
+            LD(rbias,  "mlp.gate.e_score_correction_bias");
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.global_scale",i); l->rgs = load_scalar(m,nm,1.f);
+            LD(sh_g, "mlp.shared_experts.gate_proj");
+            LD(sh_u, "mlp.shared_experts.up_proj");
+            LD(sh_d, "mlp.shared_experts.down_proj");
+        }
+        #undef LD
+        /* conv states: raw inputs of the previous K-1 steps, zero-init */
+        int kvdim = L_KV(c,i) * L_HD(c,i);
+        for (int j = 0; j < 4; j++) {
+            if (!m->cs[j]) m->cs[j] = calloc(c->n_layers, sizeof(float*));
+            int C = (j < 2) ? kvdim : D;
+            m->cs[j][i] = calloc((int64_t)C * (K-1), sizeof(float));
+        }
+    }
+    m->cache = calloc(c->n_layers, sizeof(LCache));
+    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    /* container detection: converted snapshots store experts as U8 + .qs */
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
+        st_tensor *t = st_find(&m->S, nm);
+        if (t) m->xq = (t->dtype == 3);
+        break;
+    }
+    m->dense_load_s = now_s() - t0;
+}
+
+/* ---------- routed-expert fetch: slice of fused tensors, LRU-cached ---------- */
+static void expert_get(Model *m, int layer, int eid, Slot **out) {
+    LCache *lc = &m->cache[layer];
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
+        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i]; return;
+    }
+    m->miss++;
+    Cfg *c = &m->c;
+    int64_t D = c->hidden, I = c->moe_inter;
+    int64_t n13 = 2*I*D, n2 = D*I;
+    Slot *s;
+    if (lc->n < lc->cap) {
+        s = &lc->slots[lc->n++];
+        if (m->quant_bits || m->xq) {
+            s->q13 = malloc(n13); s->q2 = malloc(n2);
+            s->s13 = falloc(2*I); s->s2 = falloc(D);
+        } else { s->f13 = falloc(n13); s->f2 = falloc(n2); }
+    } else { int lru = 0; for (int i = 1; i < lc->n; i++) if (lc->slots[i].used < lc->slots[lru].used) lru = i; s = &lc->slots[lru]; }
+    char nm[320], qs[340];
+    if (m->xq) {
+        /* colibri container: packed U8 rows + f32 row scales, raw read, no requant */
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
+        st_tensor *t = st_find(&m->S, nm);
+        int64_t rowb = t->nbytes / ((int64_t)c->n_experts * 2*I);   /* D = int8, D/2 = int4 */
+        uint8_t *raw = malloc((size_t)(2*I*rowb));
+        read_u8_slice(&m->S, nm, raw, (int64_t)eid*2*I*rowb, 2*I*rowb);
+        unpack_rows(raw, s->q13, 2*I, D, rowb);
+        snprintf(qs,sizeof(qs),"%s.qs",nm);
+        read_f32_slice(&m->S, qs, s->s13, (int64_t)eid*2*I, 2*I);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
+        t = st_find(&m->S, nm);
+        rowb = t->nbytes / ((int64_t)c->n_experts * D);
+        raw = realloc(raw, (size_t)(D*rowb));
+        read_u8_slice(&m->S, nm, raw, (int64_t)eid*D*rowb, D*rowb);
+        unpack_rows(raw, s->q2, D, I, rowb);
+        snprintf(qs,sizeof(qs),"%s.qs",nm);
+        read_f32_slice(&m->S, qs, s->s2, (int64_t)eid*D, D);
+        free(raw);
+    } else if (m->quant_bits) {
+        float *tmp = falloc(n13 > n2 ? n13 : n2);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
+        read_f32_slice(&m->S, nm, tmp, (int64_t)eid*n13, n13);
+        quantize_rows(tmp, s->q13, s->s13, 2*I, D, m->quant_bits);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
+        read_f32_slice(&m->S, nm, tmp, (int64_t)eid*n2, n2);
+        quantize_rows(tmp, s->q2, s->s2, D, I, m->quant_bits);
+        free(tmp);
+    } else {
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
+        read_f32_slice(&m->S, nm, s->f13, (int64_t)eid*n13, n13);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
+        read_f32_slice(&m->S, nm, s->f2, (int64_t)eid*n2, n2);
+    }
+    s->eid = eid; s->used = ++m->clock;
+    *out = s;
+}
+
+/* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
+static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, H = L_HEADS(c,li), KV = L_KV(c,li), hd = L_HD(c,li), ext = L_EXT(c,li);
+    int local = c->local[li];
+    int qdim = H*hd, kvdim = KV*hd, group = H/KV;
+    float *q  = falloc((int64_t)S*qdim);
+    float *k  = falloc((int64_t)S*kvdim);
+    float *vv = falloc((int64_t)S*kvdim);
+    float *rr = falloc((int64_t)S*H*c->d_rel);
+    matmul(q,  x, l->q, S, D, qdim);
+    matmul(k,  x, l->k, S, D, kvdim);
+    matmul(vv, x, l->v, S, D, kvdim);
+    matmul(rr, x, l->r, S, D, H*c->d_rel);
+    /* short convs on K and V (sequence-wise, over the raw projections) */
+    sconv_apply(k,  S, kvdim, l->k_cw, m->cs[0][li], c->conv_k);
+    sconv_apply(vv, S, kvdim, l->v_cw, m->cs[1][li], c->conv_k);
+    /* per-head q/k rmsnorm (scaling below is 1/hd, not 1/sqrt(hd), because of this) */
+    for (int s = 0; s < S; s++) {
+        for (int h = 0; h < H;  h++) rmsnorm_row(q + (int64_t)s*qdim  + h*hd, q + (int64_t)s*qdim  + h*hd, l->qn, hd, c->eps);
+        for (int h = 0; h < KV; h++) rmsnorm_row(k + (int64_t)s*kvdim + h*hd, k + (int64_t)s*kvdim + h*hd, l->kn, hd, c->eps);
+    }
+    /* append K,V to the cache */
+    for (int s = 0; s < S; s++) for (int h = 0; h < KV; h++) {
+        int t = pos0 + s;
+        memcpy(m->K[li] + ((int64_t)h*m->max_t + t)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        memcpy(m->V[li] + ((int64_t)h*m->max_t + t)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+    }
+    float scale = 1.f / (float)hd;
+    float *ctx = falloc((int64_t)S*qdim);
+    #pragma omp parallel
+    {
+        float *rl = malloc(ext * sizeof(float));
+        float *sc = malloc((size_t)m->max_t * sizeof(float));
+        #pragma omp for collapse(2) schedule(static)
+        for (int h = 0; h < H; h++) {
+            for (int s = 0; s < S; s++) {
+                int qpos = pos0 + s;
+                int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
+                /* mix the relative-bias bank for this (token, head): rl[dist] */
+                const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
+                for (int e = 0; e < ext; e++) {
+                    float acc = 0.f;
+                    for (int d = 0; d < c->d_rel; d++) acc += rv[d] * l->relp[(int64_t)d*ext + e];
+                    rl[e] = acc;
+                }
+                /* tau: log-length scaling on global layers (f32, per query pos) */
+                float tau = 1.f;
+                if (!local && c->log_floor > 0) {
+                    double en = (double)(qpos + 1) / c->log_floor;
+                    if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
+                }
+                const float *qv = q + (int64_t)s*qdim + h*hd;
+                const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                for (int t = t0; t <= qpos; t++) {
+                    const float *kv = Kh + (int64_t)t*hd;
+                    float acc = 0.f;
+                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
+                    int dist = qpos - t;
+                    sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
+                }
+                int n = qpos - t0 + 1;
+                softmax_row(sc, n);
+                float *cx = ctx + (int64_t)s*qdim + h*hd;
+                for (int d = 0; d < hd; d++) cx[d] = 0.f;
+                const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                for (int t = t0; t <= qpos; t++) {
+                    const float *vrow = Vh + (int64_t)t*hd;
+                    float a = sc[t - t0];
+                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                }
+            }
+        }
+        free(rl); free(sc);
+    }
+    matmul(out, ctx, l->o, S, qdim, D);
+    free(q); free(k); free(vv); free(rr); free(ctx);
+}
+
+/* ---------- dense MLP ---------- */
+static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
+    Cfg *c = &m->c; int D = c->hidden, I = c->dense_inter;
+    float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
+    matmul(g, x, l->dg, S, D, I);
+    matmul(u, x, l->du, S, D, I);
+    for (int64_t i = 0; i < (int64_t)S*I; i++) g[i] = siluf(g[i]) * u[i];
+    matmul(out, g, l->dd, S, I, D);
+    for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] *= l->dgs;
+    free(g); free(u);
+}
+
+/* ---------- MoE: sigmoid router + bias top-k, joint routed+shared weights ---------- */
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter, ns = c->n_shared;
+    int ET = E + ns;
+    float *logits = falloc((int64_t)S*ET);
+    matmul(logits, x, l->router, S, D, ET);
+    memset(out, 0, (int64_t)S*D*sizeof(float));
+    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    for (int s = 0; s < S; s++) {
+        float *lg = logits + (int64_t)s*ET;
+        /* selection: sigmoid(routed) + correction bias, top-K */
+        int idx[64];
+        for (int kk = 0; kk < K; kk++) {
+            int best = -1; float bv = -1e30f;
+            for (int e = 0; e < E; e++) {
+                int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+                float ch = sigmoidf(lg[e]) + l->rbias[e];
+                if (!taken && ch > bv) { bv = ch; best = e; }
+            }
+            idx[kk] = best;
+        }
+        /* combine weights: sigmoids of the raw logits of (topK routed + shared),
+         * normalized to sum 1 over all K+ns, x route_scale x gate.global_scale */
+        float w[80]; float sum = 0.f;
+        for (int kk = 0; kk < K; kk++)  { w[kk]   = sigmoidf(lg[idx[kk]]); sum += w[kk]; }
+        for (int j = 0; j < ns; j++)    { w[K+j]  = sigmoidf(lg[E+j]);     sum += w[K+j]; }
+        for (int kk = 0; kk < K+ns; kk++) w[kk] *= c->route_scale * l->rgs / sum;
+        const float *xs = x + (int64_t)s*D;
+        float *os = out + (int64_t)s*D;
+        for (int kk = 0; kk < K; kk++) {
+            Slot *e; expert_get(m, layer, idx[kk], &e);
+            int qm = m->quant_bits || m->xq;
+            if (qm) {
+                matmul_q(g, xs, e->q13,                 e->s13,     D, I);   /* gate rows  */
+                matmul_q(u, xs, e->q13 + (int64_t)I*D,  e->s13 + I, D, I);   /* up rows    */
+            } else {
+                matmul(g, xs, e->f13,                1, D, I);
+                matmul(u, xs, e->f13 + (int64_t)I*D, 1, D, I);
+            }
+            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+            if (qm) matmul_q(hh, g, e->q2, e->s2, I, D);
+            else matmul(hh, g, e->f2, 1, I, D);
+            for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
+        }
+        /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
+        for (int j = 0; j < ns; j++) {
+            matmul(g, xs, l->sh_g + (int64_t)j*I*D, 1, D, I);
+            matmul(u, xs, l->sh_u + (int64_t)j*I*D, 1, D, I);
+            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+            matmul(hh, g, l->sh_d + (int64_t)j*D*I, 1, I, D);
+            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+        }
+    }
+    free(logits); free(g); free(u); free(hh);
+}
+
+/* ---------- one forward pass over S new tokens ----------
+ * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
+ * non-NULL also writes the per-position argmax (teacher-forcing check). */
+static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *x = falloc((int64_t)S*D);
+    for (int s = 0; s < S; s++) {
+        if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, m->embed_norm, D, c->eps);
+        else memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    }
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        attention(m, l, i, nrm, S, pos0, tmp);
+        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
+        else dense_mlp(m, l, nrm, S, tmp);
+        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+    }
+    m->kv_len = pos0 + S;
+    float *last = falloc(D);
+    float *logit = falloc(c->unpad_vocab);
+    if (tf_out) {
+        for (int s = 0; s < S; s++) {
+            rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
+            for (int d = 0; d < D; d++) last[d] /= c->mup;
+            matmul(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+            int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
+            tf_out[pos0 + s] = best;
+        }
+    }
+    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    for (int d = 0; d < D; d++) last[d] /= c->mup;
+    matmul(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+    free(x); free(nrm); free(tmp); free(last);
+    return logit;
+}
+
+static void state_reset(Model *m) {
+    Cfg *c = &m->c;
+    m->kv_len = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        int kvdim = L_KV(c,i) * L_HD(c,i);
+        for (int j = 0; j < 4; j++)
+            memset(m->cs[j][i], 0, (int64_t)((j < 2) ? kvdim : c->hidden) * (c->conv_k-1) * sizeof(float));
+    }
+}
+
+static void kv_alloc(Model *m, int max_t) {
+    Cfg *c = &m->c;
+    m->max_t = max_t;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
+        m->V[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
+    }
+}
+
+/* greedy generation, olmoe.c-style */
+static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
+    for (int i = 0; i < np; i++) out[i] = prompt[i];
+    float *logit = step(m, prompt, np, 0, NULL);
+    int len = np;
+    Cfg *c = &m->c;
+    for (int s = 0; s < n_new; s++) {
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit);
+        out[len++] = best;
+        if (s == n_new - 1) break;
+        int one = best;
+        logit = step(m, &one, 1, len - 1, NULL);
+    }
+}
+
+/* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
+static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
+    Cfg *c = &m->c;
+    int cap = (int)strlen(prompt) + 16;
+    int *ids = malloc(cap * sizeof(int));
+    int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
+    if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return; }
+    kv_alloc(m, np + n_new + 8);
+    printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
+    double t0 = now_s(), t1 = 0;
+    float *logit = step(m, ids, np, 0, NULL);
+    int len = np;
+    char buf[512];
+    for (int s = 0; s < n_new; s++) {
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit);
+        if (s == 0) t1 = now_s();
+        if (best == c->eos) { printf("\n[eos after %d tokens]", s); break; }
+        int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
+        buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
+        int one = best;
+        len++;
+        if (s == n_new - 1) break;
+        logit = step(m, &one, 1, len - 1, NULL);
+    }
+    double dt = now_s() - t1;
+    int gen = len - np;
+    printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
+           t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
+    free(ids);
+}
+
+/* ---------- ref_inkling.json harness ---------- */
+static int *read_int_array(jval *o, const char *key, int *n_out) {
+    jval *a = json_get(o, key);
+    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
+    int *r = malloc(a->len * sizeof(int));
+    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
+    *n_out = a->len; return r;
+}
+
+int main(int argc, char **argv) {
+    const char *snap = getenv("SNAP");
+    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
+    const char *prompt = NULL, *refpath = "ref_inkling.json";
+    int cap = 16, bits = 0, n_new = 256, npos = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
+        else if (npos == 0) { cap = atoi(argv[i]); npos++; }
+        else if (npos == 1) { bits = atoi(argv[i]); npos++; }
+        else refpath = argv[i];
+    }
+    if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
+
+    if (prompt) {
+        Model m; model_init(&m, snap, cap, bits);
+        printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
+               m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", cap);
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        generate_stream(&m, &T, prompt, n_new);
+        return 0;
+    }
+
+    FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    char *arena=NULL; jval *ref = json_parse(buf, &arena);
+    int np, nfull, ntf;
+    int *pids  = read_int_array(ref,"prompt_ids",&np);
+    int *full  = read_int_array(ref,"full_ids",&nfull);
+    int *tfref = read_int_array(ref,"tf_pred",&ntf);
+    int ngen = nfull - np;
+
+    Model m; model_init(&m, snap, cap, bits);
+    printf("== Inkling C engine (Stage A), cache = %d experts/layer, experts @ %s ==\n",
+           cap, m.xq ? "container (int4/int8 + .qs)" : bits ? "int (runtime quant)" : "f32");
+    printf("cfg: D=%d L=%d V=%d(%d) heads=%d/%d kv=%d/%d hd=%d win=%d d_rel=%d ext=%d E=%d+%d topk=%d\n",
+           m.c.hidden, m.c.n_layers, m.c.vocab, m.c.unpad_vocab, m.c.n_heads, m.c.swa_heads,
+           m.c.n_kv, m.c.swa_kv, m.c.head_dim, m.c.window, m.c.d_rel, m.c.rel_extent,
+           m.c.n_experts, m.c.n_shared, m.c.topk);
+    printf("resident weights loaded in %.1fs | RSS: %.2f GB\n", m.dense_load_s, rss_gb());
+    kv_alloc(&m, nfull + 8);
+
+    /* pass 1: teacher-forced argmax over the full reference sequence */
+    if (tfref && ntf == nfull) {
+        int *tf = malloc(nfull * sizeof(int));
+        float *lg = step(&m, full, nfull, 0, tf);
+        free(lg);
+        int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
+        printf("teacher-forced argmax: %d/%d match\n", ok, nfull);
+        free(tf);
+        state_reset(&m);
+    }
+
+    /* pass 2: greedy generation, token-for-token vs the oracle */
+    int *out = malloc(nfull * sizeof(int));
+    double t = now_s();
+    generate(&m, pids, np, ngen, out);
+    double dt = now_s() - t;
+    int match = 0;
+    printf("Reference: "); for (int i=np;i<nfull;i++) printf("%d ", full[i]);
+    printf("\nC engine : "); for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
+    printf("\nMatching tokens: %d/%d\n", match, ngen);
+    double tot = m.hits + m.miss;
+    printf("PEAK RSS: %.2f GB | expert cache hit %.1f%% | %.2f tok/s\n",
+           rss_gb(), tot?100.0*m.hits/tot:0.0, ngen/dt);
+    free(buf); free(arena);
+    return (match == ngen) ? 0 : 1;
+}
