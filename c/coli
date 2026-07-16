@@ -631,6 +631,16 @@ def cmd_bench(a):
         print(f"  {C.dim}downloading missing datasets: {', '.join(missing)}{C.r}")
         subprocess.call([py, os.path.join(TOOLS,"fetch_benchmarks.py"),
                          "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
+        # il fetch riprova da solo (#304), ma se l'hub resta giu' il bench gira sui task
+        # disponibili invece di passare a eval file inesistenti.
+        # EN: the fetch retries on its own (#304), but if the hub stays down the bench
+        # runs on the available tasks instead of handing eval nonexistent files.
+        still=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
+        if still:
+            tasks=",".join(t for t in tasks.split(",") if t not in still)
+            print(f"  {C.yel}skipping (download failed, rerun later): {', '.join(still)}{C.r}")
+            if not tasks:
+                print(f"  {C.yel}no datasets available — nothing to bench{C.r}"); sys.exit(1)
     cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--glm", GLM, "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
