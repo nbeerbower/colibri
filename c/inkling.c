@@ -1055,6 +1055,9 @@ static void state_reset(Model *m) {
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
+    if (m->K && max_t <= m->max_t) return;   /* reuse across prompts when big enough */
+    if (m->K) for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
+    free(m->K); free(m->V);
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
@@ -1150,26 +1153,39 @@ int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
-    const char *prompt = NULL, *refpath = "ref_inkling.json";
+    const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
     int cap = -1, bits = 0, n_new = 256, npos = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
     }
-    if (cap < 0) cap = prompt ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
+    if (cap < 0) cap = (prompt || pfile) ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
 
-    if (prompt) {
+    if (prompt || pfile) {
         Model m; model_init(&m, snap, cap, bits);
         printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
                m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", m.cache[0].cap);
         pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
-        generate_stream(&m, &T, prompt, n_new);
+        if (prompt) generate_stream(&m, &T, prompt, n_new);
+        else {   /* -f: one prompt per line, model loaded once, usage accumulates */
+            FILE *pf = fopen(pfile, "rb"); if (!pf) { perror(pfile); return 1; }
+            char ln[8192]; int np = 0;
+            while (fgets(ln, sizeof(ln), pf)) {
+                size_t n = strlen(ln); while (n && (ln[n-1]=='\n'||ln[n-1]=='\r')) ln[--n]=0;
+                if (!n || ln[0]=='#') continue;
+                printf("\n===== prompt %d =====\n", ++np);
+                state_reset(&m);
+                generate_stream(&m, &T, ln, n_new);
+            }
+            fclose(pf);
+        }
         usage_save(&m, snap);
         double tot = m.hits + m.miss;
         printf("[cache] hit %.1f%% (%llu hit / %llu load) | usage history saved\n",
