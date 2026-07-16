@@ -109,6 +109,7 @@ typedef struct {
     uint32_t **eusage;                    /* per-layer expert selection counts */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss;
+    double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
@@ -943,8 +944,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
     /* pass 2: one parallel burst for every miss in this layer call */
     if (nfill) {
+        double tf = now_s();
         #pragma omp parallel for schedule(dynamic,1)
         for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+        m->t_fill += now_s() - tf;
     }
     /* pass 3: compute. gate+up run as ONE matmul over the fused 2I rows —
      * halves the number of (expensive to open) parallel regions per expert */
@@ -954,6 +957,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         const float *xs = x + (int64_t)s*D;
         float *os = out + (int64_t)s*D;
         float *w = wgt + (int64_t)s*(K+ns);
+        double te = now_s();
         for (int kk = 0; kk < K; kk++) {
             Slot *e = use[(int64_t)s*K + kk];
             if (m->xq) {
@@ -977,6 +981,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
+        double ts = now_s(); m->t_expert += ts - te;
         /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
         for (int j = 0; j < ns; j++) {
             matmul_w(g, xs, wt_off(l->sh_g, (int64_t)j*I*D), 1, D, I);
@@ -985,6 +990,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             matmul_w(hh, g, wt_off(l->sh_d, (int64_t)j*D*I), 1, I, D);
             for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
         }
+        m->t_shared += now_s() - ts;
     }
     free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
     free(g); free(hh);              /* u aliases g+I */
@@ -1004,7 +1010,9 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        double ta = now_s();
         attention(m, l, i, nrm, S, pos0, tmp);
+        m->t_attn += now_s() - ta;
         sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
@@ -1099,6 +1107,10 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int gen = len - np;
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
+    double wall = now_s() - t0;
+    printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | other %.1fs\n",
+           m->t_fill, m->t_expert, m->t_shared, m->t_attn,
+           wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
     free(ids);
 }
 
