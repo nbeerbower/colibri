@@ -911,8 +911,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         #pragma omp parallel for schedule(dynamic,1)
         for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
     }
-    /* pass 3: compute */
-    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    /* pass 3: compute. gate+up run as ONE matmul over the fused 2I rows —
+     * halves the number of (expensive to open) parallel regions per expert */
+    float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s*D;
@@ -922,24 +923,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             Slot *e = use[(int64_t)s*K + kk];
             if (m->xq) {
                 if (q4) {
-                    matmul_q4(g, xs, e->p13,                    e->s13,     D, I);   /* gate rows */
-                    matmul_q4(u, xs, e->p13 + (int64_t)I*m->rb13, e->s13 + I, D, I); /* up rows   */
+                    matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
                     for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
                     matmul_q4(hh, g, e->p2, e->s2, I, D);
                 } else {
-                    matmul_q(g, xs, (int8_t*)e->p13,                 e->s13,     D, I);
-                    matmul_q(u, xs, (int8_t*)e->p13 + (int64_t)I*D,  e->s13 + I, D, I);
+                    matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
                     for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
                     matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
                 }
             } else if (m->quant_bits) {
-                matmul_q(g, xs, e->q13,                 e->s13,     D, I);
-                matmul_q(u, xs, e->q13 + (int64_t)I*D,  e->s13 + I, D, I);
+                matmul_q(g, xs, e->q13, e->s13, D, 2*I);
                 for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
                 matmul_q(hh, g, e->q2, e->s2, I, D);
             } else {
-                matmul(g, xs, e->f13,                1, D, I);
-                matmul(u, xs, e->f13 + (int64_t)I*D, 1, D, I);
+                matmul(g, xs, e->f13, 1, D, 2*I);
                 for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
                 matmul(hh, g, e->f2, 1, I, D);
             }
@@ -955,7 +952,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
-    free(g); free(u); free(hh);
+    free(g); free(hh);              /* u aliases g+I */
 }
 
 /* ---------- one forward pass over S new tokens ----------
@@ -1080,6 +1077,22 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
+    /* OpenMP hot-thread tuning, same trick (and rationale) as glm.c: the
+     * per-expert matmul regions are tiny and back-to-back; the default passive
+     * wait policy parks the team between regions and re-wake latency dominates.
+     * libgomp reads OMP_/GOMP_ vars before main(), so seed them and re-exec
+     * once (COLI_OMP_TUNED guards the exec; COLI_NO_OMP_TUNE=1 disables). */
+    if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
+        setenv("OMP_WAIT_POLICY","active",0);
+        setenv("GOMP_SPINCOUNT","200000",0);
+        setenv("OMP_PROC_BIND","close",0);
+        setenv("OMP_DYNAMIC","FALSE",0);
+        setenv("COLI_OMP_TUNED","1",1);
+#ifdef __linux__
+        execv("/proc/self/exe", argv);
+        perror("[OMP] execv self-reexec failed, running untuned");
+#endif
+    }
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
