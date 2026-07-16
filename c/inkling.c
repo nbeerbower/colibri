@@ -56,18 +56,23 @@ typedef struct {
 #define L_HD(c,i)    ((c)->local[i] ? (c)->swa_hd    : (c)->head_dim)
 #define L_EXT(c,i)   ((c)->local[i] ? (c)->window    : (c)->rel_extent)
 
-/* ---------- resident per-layer weights (f32) ---------- */
+/* ---------- resident weights ----------
+ * Large matmul weights keep their on-disk dtype in RAM: bf16 for the real
+ * 975B checkpoint (f32 residents would need ~172 GB, over sabre's 187),
+ * f32 for the tiny oracle (bit-exact validation). Exactly one pointer set. */
+typedef struct { float *f; uint16_t *h; } Wt;
+
 typedef struct {
     float *in_ln, *post_ln;
-    float *q, *k, *v, *r, *o;             /* projections */
+    Wt q, k, v, r, o;                     /* projections */
     float *qn, *kn;                       /* per-head rmsnorm [head_dim] */
     float *relp;                          /* [d_rel, ext] bias bank */
     float *k_cw, *v_cw, *a_cw, *m_cw;     /* sconv weights, [C*K] depthwise */
     /* dense layers */
-    float *dg, *du, *dd, dgs;
+    Wt dg, du, dd; float dgs;
     /* MoE layers */
     float *router, *rbias, rgs;           /* [E+ns, D], [E], scalar */
-    float *sh_g, *sh_u, *sh_d;            /* shared experts [ns][I,D] etc. */
+    Wt sh_g, sh_u, sh_d;                  /* shared experts [ns][I,D] etc. */
 } Layer;
 
 /* ---------- routed-expert LRU cache ---------- */
@@ -83,7 +88,8 @@ typedef struct {
     shards S;
     int quant_bits;                       /* 0 = f32 experts (oracle mode) */
     int xq;                               /* experts on disk are a colibri container (U8 + .qs) */
-    float *embed, *embed_norm, *lm_head, *final_norm;
+    Wt embed, lm_head;
+    float *embed_norm, *final_norm;
     Layer *L;
     LCache *cache;
     uint64_t clock, hits, miss;
@@ -117,8 +123,113 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
     }
 }
 
-/* y[1,O] = x @ q^T with per-row int quantization (same container math as olmoe.c) */
+#if defined(__AVX512BF16__) && defined(__AVX512F__)
+#include <immintrin.h>
+#define HAVE_BF16_DOT 1
+#endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+/* bf16-weight matmul: activations rounded to bf16 per row (matches the HF
+ * bf16 reference numerics), hardware vdpbf16ps dot where available,
+ * shift-to-f32 scalar otherwise. */
+static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
+#ifdef HAVE_BF16_DOT
+    if (I % 32 == 0) {
+        uint16_t *xh = malloc((size_t)S * I * sizeof(uint16_t));
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            uint16_t *xd = xh + (int64_t)s * I;
+            for (int i = 0; i < I; i += 32) {
+                __m512 a = _mm512_loadu_ps(xs + i), b = _mm512_loadu_ps(xs + i + 16);
+                _mm512_storeu_si512(xd + i, (__m512i)_mm512_cvtne2ps_pbh(b, a));
+            }
+        }
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint16_t *w = W + (int64_t)o * I;
+            for (int s = 0; s < S; s++) {
+                const uint16_t *xs = xh + (int64_t)s * I;
+                __m512 acc = _mm512_setzero_ps();
+                for (int i = 0; i < I; i += 32)
+                    acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(xs + i),
+                                                (__m512bh)_mm512_loadu_si512(w + i));
+                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
+            }
+        }
+        free(xh);
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint16_t *w = W + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) {
+                union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
+                acc += xs[i] * v.f;
+            }
+            y[(int64_t)s * O + o] = acc;
+        }
+    }
+}
+
+/* dispatch on the weight's resident dtype */
+static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
+    if (W.f) matmul(y, x, W.f, S, I, O);
+    else     matmul_h(y, x, W.h, S, I, O);
+}
+
+/* y[1,O] = x @ q^T, int8 weights + per-row scale. Fast path: activations
+ * quantized Q8 per 32-block, VNNI (or maddubs) int8 dot — same family as
+ * glm.c's IDOT kernels; IDOT=0 falls back to the byte-exact scalar route. */
+#if defined(__AVX2__)
+static inline __m256i i8dot_block(__m256i acc, __m256i a, __m256i b) {
+    __m256i ax = _mm256_sign_epi8(a, a);        /* |a| as u8 */
+    __m256i sy = _mm256_sign_epi8(b, a);        /* b * sign(a) */
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(acc, ax, sy);
+#else
+    __m256i p = _mm256_maddubs_epi16(ax, sy);
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_set1_epi16(1)));
+#endif
+}
+#endif
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+#if defined(__AVX2__)
+    static int idot = -1;
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot && I % 32 == 0 && I <= 8192) {
+        int nb = I / 32;
+        int8_t xi[8192]; float xs[256];
+        for (int b = 0; b < nb; b++) {
+            const float *xb = x + b*32;
+            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
+            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
+            xs[b] = s; float inv = 1.f/s;
+            for (int i = 0; i < 32; i++) xi[b*32+i] = (int8_t)lrintf(xb[i]*inv);
+        }
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            float acc = 0.f;
+            for (int b = 0; b < nb; b++) {
+                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
+                                           _mm256_loadu_si256((const __m256i*)(xi + b*32)),
+                                           _mm256_loadu_si256((const __m256i*)(w + b*32)));
+                __m128i lo = _mm256_castsi256_si128(vacc), hi = _mm256_extracti128_si256(vacc, 1);
+                __m128i s4 = _mm_add_epi32(lo, hi);
+                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
+                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
+            }
+            y[o] = acc * scale[o];
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
@@ -271,6 +382,25 @@ static float load_scalar(Model *m, const char *name, float dflt) {
     float v; st_read_f32(&m->S, name, &v, 0); return v;
 }
 
+/* big matmul weights keep their on-disk dtype resident: BF16 raw (real
+ * checkpoint, halves RAM), anything else as f32 (tiny oracle: bit-exact) */
+static Wt load_w(Model *m, const char *name) {
+    Wt w = {0};
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (t->dtype == 0) { w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); } st_read_raw(&m->S, name, w.h, 0); }
+    else               { w.f = falloc(t->numel); st_read_f32(&m->S, name, w.f, 0); }
+    return w;
+}
+static Wt wt_off(Wt w, int64_t off) {
+    Wt r = { w.f ? w.f + off : NULL, w.h ? w.h + off : NULL };
+    return r;
+}
+static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
+    if (w.f) memcpy(out, w.f + off, n * sizeof(float));
+    else for (int i = 0; i < n; i++) { union { uint32_t u; float f; } v = { (uint32_t)w.h[off + i] << 16 }; out[i] = v.f; }
+}
+
 /* f32 slice of a (possibly bf16/f16) tensor: element offset + count.
  * Needed to stream one expert out of the fused [E,2I,D]/[E,D,I] tensors. */
 static void read_f32_slice(shards *S, const char *name, float *out, int64_t off, int64_t cnt) {
@@ -319,20 +449,21 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
-    m->embed      = load_t(m, "model.embed_tokens.weight");
+    m->embed      = load_w(m, "model.embed_tokens.weight");
     m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
     m->final_norm = load_t(m, "model.norm.weight");
-    m->lm_head    = load_t(m, "lm_head.weight");
+    m->lm_head    = load_w(m, "lm_head.weight");
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[320];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
+        #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
+        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm)
         LD(in_ln,  "input_layernorm.weight");
         LD(post_ln,"post_attention_layernorm.weight");
-        LD(q, "self_attn.q_proj.weight"); LD(k, "self_attn.k_proj.weight");
-        LD(v, "self_attn.v_proj.weight"); LD(r, "self_attn.r_proj.weight");
-        LD(o, "self_attn.o_proj.weight");
+        LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
+        LDW(v, "self_attn.v_proj.weight"); LDW(r, "self_attn.r_proj.weight");
+        LDW(o, "self_attn.o_proj.weight");
         LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
         LD(relp, "self_attn.rel_logits_proj.proj");
         LD(k_cw, "self_attn.k_sconv.conv1d.weight");
@@ -340,17 +471,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         LD(a_cw, "attn_sconv.conv1d.weight");
         LD(m_cw, "mlp_sconv.conv1d.weight");
         if (!c->sparse[i]) {
-            LD(dg, "mlp.gate_proj.weight"); LD(du, "mlp.up_proj.weight"); LD(dd, "mlp.down_proj.weight");
+            LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.global_scale",i); l->dgs = load_scalar(m,nm,1.f);
         } else {
             LD(router, "mlp.gate.weight");
             LD(rbias,  "mlp.gate.e_score_correction_bias");
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.global_scale",i); l->rgs = load_scalar(m,nm,1.f);
-            LD(sh_g, "mlp.shared_experts.gate_proj");
-            LD(sh_u, "mlp.shared_experts.up_proj");
-            LD(sh_d, "mlp.shared_experts.down_proj");
+            LDW(sh_g, "mlp.shared_experts.gate_proj");
+            LDW(sh_u, "mlp.shared_experts.up_proj");
+            LDW(sh_d, "mlp.shared_experts.down_proj");
         }
         #undef LD
+        #undef LDW
         /* conv states: raw inputs of the previous K-1 steps, zero-init */
         int kvdim = L_KV(c,i) * L_HD(c,i);
         for (int j = 0; j < 4; j++) {
@@ -438,10 +570,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     float *k  = falloc((int64_t)S*kvdim);
     float *vv = falloc((int64_t)S*kvdim);
     float *rr = falloc((int64_t)S*H*c->d_rel);
-    matmul(q,  x, l->q, S, D, qdim);
-    matmul(k,  x, l->k, S, D, kvdim);
-    matmul(vv, x, l->v, S, D, kvdim);
-    matmul(rr, x, l->r, S, D, H*c->d_rel);
+    matmul_w(q,  x, l->q, S, D, qdim);
+    matmul_w(k,  x, l->k, S, D, kvdim);
+    matmul_w(vv, x, l->v, S, D, kvdim);
+    matmul_w(rr, x, l->r, S, D, H*c->d_rel);
     /* short convs on K and V (sequence-wise, over the raw projections) */
     sconv_apply(k,  S, kvdim, l->k_cw, m->cs[0][li], c->conv_k);
     sconv_apply(vv, S, kvdim, l->v_cw, m->cs[1][li], c->conv_k);
@@ -503,7 +635,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         }
         free(rl); free(sc);
     }
-    matmul(out, ctx, l->o, S, qdim, D);
+    matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(ctx);
 }
 
@@ -511,10 +643,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
 static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, I = c->dense_inter;
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
-    matmul(g, x, l->dg, S, D, I);
-    matmul(u, x, l->du, S, D, I);
+    matmul_w(g, x, l->dg, S, D, I);
+    matmul_w(u, x, l->du, S, D, I);
     for (int64_t i = 0; i < (int64_t)S*I; i++) g[i] = siluf(g[i]) * u[i];
-    matmul(out, g, l->dd, S, I, D);
+    matmul_w(out, g, l->dd, S, I, D);
     for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] *= l->dgs;
     free(g); free(u);
 }
@@ -566,10 +698,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
         for (int j = 0; j < ns; j++) {
-            matmul(g, xs, l->sh_g + (int64_t)j*I*D, 1, D, I);
-            matmul(u, xs, l->sh_u + (int64_t)j*I*D, 1, D, I);
+            matmul_w(g, xs, wt_off(l->sh_g, (int64_t)j*I*D), 1, D, I);
+            matmul_w(u, xs, wt_off(l->sh_u, (int64_t)j*I*D), 1, D, I);
             for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            matmul(hh, g, l->sh_d + (int64_t)j*D*I, 1, I, D);
+            matmul_w(hh, g, wt_off(l->sh_d, (int64_t)j*D*I), 1, I, D);
             for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
         }
     }
@@ -583,8 +715,8 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) {
-        if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, m->embed_norm, D, c->eps);
-        else memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+        wt_row_f32(m->embed, (int64_t)ids[s]*D, x + (int64_t)s*D, D);
+        if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, x + (int64_t)s*D, m->embed_norm, D, c->eps);
     }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = 0; i < c->n_layers; i++) {
@@ -606,14 +738,14 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
         for (int s = 0; s < S; s++) {
             rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
             for (int d = 0; d < D; d++) last[d] /= c->mup;
-            matmul(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+            matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
             int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
             tf_out[pos0 + s] = best;
         }
     }
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     for (int d = 0; d < D; d++) last[d] /= c->mup;
-    matmul(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+    matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
     free(x); free(nrm); free(tmp); free(last);
     return logit;
 }
