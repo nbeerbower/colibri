@@ -250,12 +250,15 @@ def convert_dir(indir, outdir, xbits, watch=False, delete_src=False):
                   flush=True)
             if delete_src:
                 os.remove(sp)
-        # completion check: every shard named in the index is converted
+        # completion check: every model-* shard named in the index is
+        # converted. The index also references mtp.safetensors (the separate
+        # MTP-head file, skipped entirely) — only count files we convert.
         total = None
         if os.path.exists(index_path):
             wm = json.load(open(index_path))["weight_map"]
-            total = sorted(set(wm.values()))
-            if all(os.path.exists(os.path.join(outdir, shard_out_name(s))) for s in total):
+            total = sorted(s for s in set(wm.values())
+                           if re.match(r"model-\d+-of-\d+\.safetensors$", s))
+            if total and all(os.path.exists(os.path.join(outdir, shard_out_name(s))) for s in total):
                 break
         elif shards and not watch:
             break
