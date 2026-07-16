@@ -1,0 +1,49 @@
+# CI: the checks CONTRIBUTING.md asks reviewers to run by hand.
+#  - `make check`: one portable CPU build + C unit tests + Python stdlib tests
+#    (no model download, no CUDA — same contract as the local target)
+#  - zero-warnings gate: the review bar is "clean build (0 warnings)", so the
+#    glm build fails CI if gcc emits any warning
+# CUDA and model-oracle validation stay manual: runners have no GPU and the
+# tiny oracle snapshots are not in the repo.
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Apple clang has no bundled OpenMP runtime; the Makefile falls back to a
+      # single-threaded build without it, so install libomp to test the real path.
+      - name: Install libomp (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+      - name: make check
+        run: make check
+
+  warnings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build glm with a clean log
+        run: |
+          make -C c glm ARCH=x86-64-v3 2>&1 | tee build.log
+          if grep -E "warning:" build.log; then
+            echo "::error::build emitted warnings — the review bar is 0 warnings"
+            exit 1
+          fi
+      - name: Build olmoe with a clean log
+        run: |
+          make -C c olmoe ARCH=x86-64-v3 2>&1 | tee build2.log
+          if grep -E "warning:" build2.log; then
+            echo "::error::build emitted warnings — the review bar is 0 warnings"
+            exit 1
+          fi
