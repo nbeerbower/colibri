@@ -16,6 +16,10 @@ static size_t g_xcap = 0, g_ycap = 0;
 static int g_ok = 0;
 
 extern "C" int ink_cuda_init(int dev) {
+    /* ~727 tiny matmul calls per decoded token: the default yield-based sync
+     * costs ~0.5-1 ms of wakeup latency per call. Spin-sync in the driver is
+     * one busy thread — affordable since the OMP team no longer spins. */
+    cudaSetDeviceFlags(cudaDeviceScheduleSpin);
     if (cudaSetDevice(dev) != cudaSuccess) return -1;
     if (cudaStreamCreate(&g_st) != cudaSuccess) return -1;
     /* fail fast on a broken runtime instead of at the first matmul */
