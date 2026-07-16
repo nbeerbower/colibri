@@ -794,25 +794,25 @@ static void pins_load(Model *m, const char *snap) {
  * glm's .coli_usage — copy it aside if you need a stable ranking).
  * USAGE_SAVE=0 skips the rewrite (e.g. benchmark loops that would skew the
  * ranking); PIN=off also implies no save (that run never seeded counts). */
-static void usage_save(Model *m, const char *snap) {
+static int usage_save(Model *m, const char *snap) {
     Cfg *c = &m->c; int E = c->n_experts;
     char up[2048], tp[2060];
     const char *env = getenv("PIN");
     const char *sv = getenv("USAGE_SAVE");
-    if (sv && *sv == '0') return;
-    if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return;
+    if (sv && *sv == '0') return 0;
+    if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
     snprintf(tp, sizeof(tp), "%s.tmp", up);
     FILE *f = fopen(tp, "wb");
-    if (!f) return;
+    if (!f) return 0;
     uint32_t hdr[3] = { 0x31554B49u, (uint32_t)c->n_layers, (uint32_t)E };
     fwrite(hdr, 4, 3, f);
     uint32_t *zero = calloc(E, 4);
     for (int i = 0; i < c->n_layers; i++)
         fwrite(m->eusage[i] ? m->eusage[i] : zero, 4, E, f);
     free(zero); fclose(f);
-    rename(tp, up);
+    return rename(tp, up) == 0;
 }
 
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
@@ -1198,11 +1198,12 @@ int main(int argc, char **argv) {
             }
             fclose(pf);
         }
-        usage_save(&m, snap);
+        int saved = usage_save(&m, snap);
         double tot = m.hits + m.miss;
-        printf("[cache] hit %.1f%% (%llu hit / %llu load) | usage history saved\n",
+        printf("[cache] hit %.1f%% (%llu hit / %llu load)%s\n",
                tot ? 100.0*m.hits/tot : 0.0,
-               (unsigned long long)m.hits, (unsigned long long)m.miss);
+               (unsigned long long)m.hits, (unsigned long long)m.miss,
+               saved ? " | usage history saved" : "");
         return 0;
     }
 
