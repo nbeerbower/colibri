@@ -269,6 +269,9 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
+inkling$(EXE): inkling.c st.h json.h compat.h
+	$(CC) $(CFLAGS) inkling.c -o inkling$(EXE) $(LDFLAGS)
+
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.

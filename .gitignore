@@ -13,6 +13,7 @@ desktop/src-tauri/gen/
 c/glm
 c/glm.exe
 c/olmoe
+c/inkling
 c/olmoe.exe
 c/iobench
 c/iobench.exe
