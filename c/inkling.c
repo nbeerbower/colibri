@@ -32,6 +32,10 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#ifdef COLI_CUDA
+#include "backend_cuda_ink.h"
+static int g_cuda = 0;
+#endif
 
 #define MAXL 256
 
@@ -59,8 +63,11 @@ typedef struct {
 /* ---------- resident weights ----------
  * Large matmul weights keep their on-disk dtype in RAM: bf16 for the real
  * 975B checkpoint (f32 residents would need ~172 GB, over sabre's 187),
- * f32 for the tiny oracle (bit-exact validation). Exactly one pointer set. */
-typedef struct { float *f; uint16_t *h; } Wt;
+ * f32 for the tiny oracle (bit-exact validation). Under CUDA, bf16 tensors
+ * move to VRAM (dev set, host freed): decode reads ~35 GB of residents per
+ * token, so this trades the DDR5 bandwidth wall for VRAM bandwidth AND
+ * frees the same RAM for the expert cache. */
+typedef struct { float *f; uint16_t *h; void *dev; } Wt;
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -186,8 +193,14 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
-/* dispatch on the weight's resident dtype */
+/* dispatch on where the weight lives */
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
+#ifdef COLI_CUDA
+    if (W.dev) {
+        if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) == 0) return;
+        fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
+    }
+#endif
     if (W.f) matmul(y, x, W.f, S, I, O);
     else     matmul_h(y, x, W.h, S, I, O);
 }
@@ -460,14 +473,25 @@ static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
 }
 
 /* big matmul weights keep their on-disk dtype resident: BF16 raw (real
- * checkpoint, halves RAM), anything else as f32 (tiny oracle: bit-exact) */
-static Wt load_w(Model *m, const char *name) {
+ * checkpoint, halves RAM), anything else as f32 (tiny oracle: bit-exact).
+ * gpu_ok: bf16 tensors move to VRAM while budget lasts (embed stays host —
+ * it's a row lookup, not a matmul). */
+static Wt load_w(Model *m, const char *name, int gpu_ok) {
     Wt w = {0};
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
     if (t->dtype == 0) {
         w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); }
         pread_all(t->fd, w.h, t->nbytes, t->off);
+#ifdef COLI_CUDA
+        /* keep 3 GB VRAM headroom for the activation buffers + future tiers */
+        if (g_cuda && gpu_ok && ink_cuda_free_bytes() > (size_t)t->nbytes + (3ULL<<30)) {
+            w.dev = ink_cuda_upload(w.h, t->nbytes);
+            if (w.dev) { free(w.h); w.h = NULL; }
+        }
+#else
+        (void)gpu_ok;
+#endif
     } else {
         w.f = falloc(t->numel);
         st_read_f32(&m->S, name, w.f, 0);
@@ -475,7 +499,8 @@ static Wt load_w(Model *m, const char *name) {
     return w;
 }
 static Wt wt_off(Wt w, int64_t off) {
-    Wt r = { w.f ? w.f + off : NULL, w.h ? w.h + off : NULL };
+    Wt r = { w.f ? w.f + off : NULL, w.h ? w.h + off : NULL,
+             w.dev ? (char*)w.dev + off*2 : NULL };   /* dev is always bf16 */
     return r;
 }
 static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
@@ -533,16 +558,26 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
-    m->embed      = load_w(m, "model.embed_tokens.weight");
+#ifdef COLI_CUDA
+    if (!getenv("NOGPU")) {
+        int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
+        if (ink_cuda_init(dev) == 0) {
+            g_cuda = 1;
+            fprintf(stderr, "[cuda] device %d ready, %.1f GB free — bf16 residents to VRAM\n",
+                    dev, ink_cuda_free_bytes()/1e9);
+        } else fprintf(stderr, "[cuda] init failed, running on CPU\n");
+    }
+#endif
+    m->embed      = load_w(m, "model.embed_tokens.weight", 0);
     m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
     m->final_norm = load_t(m, "model.norm.weight");
-    m->lm_head    = load_w(m, "lm_head.weight");
+    m->lm_head    = load_w(m, "lm_head.weight", 1);
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[320];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
-        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm)
+        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
         LD(in_ln,  "input_layernorm.weight");
         LD(post_ln,"post_attention_layernorm.weight");
         LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
@@ -1081,7 +1116,10 @@ int main(int argc, char **argv) {
      * per-expert matmul regions are tiny and back-to-back; the default passive
      * wait policy parks the team between regions and re-wake latency dominates.
      * libgomp reads OMP_/GOMP_ vars before main(), so seed them and re-exec
-     * once (COLI_OMP_TUNED guards the exec; COLI_NO_OMP_TUNE=1 disables). */
+     * once (COLI_OMP_TUNED guards the exec; COLI_NO_OMP_TUNE=1 disables).
+     * NOT under CUDA — same exception glm.c makes: a spinning 24-thread team
+     * starves the CUDA driver during every stream sync. */
+#ifndef COLI_CUDA
     if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
@@ -1093,6 +1131,7 @@ int main(int argc, char **argv) {
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+#endif  /* !COLI_CUDA */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
