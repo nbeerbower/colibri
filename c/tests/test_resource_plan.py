@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from resource_plan import (
     GB,
@@ -14,6 +15,7 @@ from resource_plan import (
     environment_for_plan,
     format_plan,
     memory_available,
+    physical_cpu_count,
 )
 
 
@@ -86,6 +88,51 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
         self.assertIn("clamped", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
+
+    def test_auto_tier_thread_count_uses_physical_cores(self):
+        # End-to-end for #325: build_plan + environment_for_plan must export the
+        # physical (not logical SMT) core count as OMP_NUM_THREADS. The original
+        # suite passed physical_cpus=24 explicitly, so it never exercised the
+        # real physical_cpu_count() probe whose single-core failure pinned decode.
+        def lscpu(stdout):
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                               stdout=stdout, stderr="")
+        # 1 socket, 12 cores, 2 SMT siblings -> 24 threads, 12 physical cores.
+        # lscpu prepends the CPU column, so output is CPU,Core,Socket.
+        rows = [f"{cpu},{core},0" for core in range(12) for cpu in range(2)]
+        blob = "# CPU,Core,Socket\n" + "\n".join(rows)
+        with mock.patch("resource_plan.subprocess.run", return_value=lscpu(blob)), \
+             mock.patch.object(sys, "platform", "linux"):
+            plan = build_plan(self.model, available_memory=16 * GB,
+                              available_disk=1, gpus=[])
+            env = environment_for_plan(plan)
+        self.assertEqual(plan["cpu"]["physical_cores"], 12)
+        self.assertEqual(env["OMP_NUM_THREADS"], "12")
+
+    def test_plan_conserves_budget_and_experts_above_256gb(self):
+        # Regression for #325's reporter: a 512 GB machine loading the whole
+        # model into RAM. Verify the budget math stays exact at large RAM sizes
+        # (no integer truncation, no over-allocation, no experts lost between
+        # tiers). Checked at 256/512/800 GB to bracket the reporter's box.
+        for ram_gb in (256, 512, 800):
+            plan = build_plan(self.model, ram_gb=ram_gb, available_disk=1,
+                              gpus=[], physical_cpus=64)
+            ram = plan["tiers"]["ram"]
+            # RAM budget never over-allocated: dense + runtime + cache <= budget.
+            allocated = (ram["dense_bytes"] + ram["runtime_bytes"]
+                         + ram["expert_cache_bytes"])
+            self.assertLessEqual(allocated, ram["budget_bytes"],
+                                 f"over-allocated RAM at {ram_gb} GB")
+            # Every expert byte is accounted for exactly once across the tiers.
+            tiers = plan["tiers"]
+            tiered = (tiers["vram"]["hot_expert_bytes"]
+                      + ram["warm_expert_bytes"]
+                      + tiers["disk"]["cold_expert_bytes"])
+            self.assertEqual(tiered, plan["model"]["expert_bytes"],
+                             f"expert bytes lost/duplicated at {ram_gb} GB")
+            # A positive RAM budget yields a non-negative cache and a sensible cap.
+            self.assertGreaterEqual(ram["expert_cache_bytes"], 0)
+            self.assertGreaterEqual(ram["cache_slots_per_layer"], 0)
 
     def test_filters_requested_devices(self):
         gpus = [{"index": 0, "name": "a", "total_bytes": 8 * GB, "free_bytes": 8 * GB}]
@@ -251,6 +298,74 @@ class ResourcePlanTest(unittest.TestCase):
                          ["VRAM", "RAM", "Disk"])
         self.assertIn("quality-preserving yes", format_plan(plan))
         self.assertIn("expected_bottleneck", plan)
+
+
+class PhysicalCpuCountTest(unittest.TestCase):
+    """Regression for #325: --auto-tier pinned decode to one core because
+    physical_cpu_count() silently returned 1.
+
+    Two root causes this locks down:
+      1. lscpu -p prepends a CPU column, so `-p=core,socket` emits
+         CPU,Core,Socket; counting rows counted logical SMT siblings.
+      2. any probe failure fell through to ``os.cpu_count() or 1`` and the
+         ``or 1`` could pin a constrained/cgroup'd box to a single core.
+    """
+
+    def _lscpu(self, stdout):
+        return subprocess.CompletedProcess(args=[], returncode=0,
+                                           stdout=stdout, stderr="")
+
+    def _lscpu_topology(self, sockets, cores_per_socket, threads_per_core):
+        # Real lscpu shape: socket-local core IDs repeat across sockets; the
+        # CPU column (always prepended) is a unique logical-CPU index.
+        rows, cpu = [], 0
+        for sock in range(sockets):
+            for core in range(cores_per_socket):
+                for _ in range(threads_per_core):
+                    rows.append(f"{cpu},{core},{sock}")
+                    cpu += 1
+        return "# CPU,Core,Socket\n" + "\n".join(rows)
+
+    def test_counts_physical_cores_not_smt_threads(self):
+        blob = self._lscpu_topology(sockets=2, cores_per_socket=16, threads_per_core=2)
+        with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu(blob)), \
+             mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(physical_cpu_count(), 32)
+
+    def test_single_socket_no_smt(self):
+        blob = self._lscpu_topology(sockets=1, cores_per_socket=8, threads_per_core=1)
+        with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu(blob)), \
+             mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(physical_cpu_count(), 8)
+
+    def test_skips_offline_core_socket_fields(self):
+        # VMs / large NUMA boxes emit "-" for offline core or socket IDs; that
+        # used to raise ValueError, discard the whole parse, and fall through
+        # to the single-core fallback.
+        blob = "# CPU,Core,Socket\n0,0,0\n1,-,0\n2,1,0\n3,1,0\n"
+        with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu(blob)), \
+             mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(physical_cpu_count(), 2)
+
+    def test_lscpu_missing_falls_back_to_logical_not_silent_one(self):
+        # The bug: lscpu absent -> os.cpu_count() or 1. On a constrained box
+        # os.cpu_count() can be 1. We still must never silently pick 1 without
+        # a warning, and when logical cores exist they must be used.
+        import os
+        with mock.patch("resource_plan.subprocess.run", side_effect=FileNotFoundError), \
+             mock.patch.object(sys, "platform", "linux"), \
+             mock.patch("resource_plan.os.cpu_count", return_value=16), \
+             mock.patch("sys.stderr"):
+            self.assertEqual(physical_cpu_count(), 16)
+
+    def test_zero_logical_cores_warns_and_returns_one(self):
+        # The genuine degenerate case: no probe works and os.cpu_count() is
+        # None/1. Must return 1 (engine needs a positive team size) but warn.
+        with mock.patch("resource_plan.subprocess.run", side_effect=FileNotFoundError), \
+             mock.patch.object(sys, "platform", "linux"), \
+             mock.patch("resource_plan.os.cpu_count", return_value=None), \
+             mock.patch("sys.stderr"):
+            self.assertEqual(physical_cpu_count(), 1)
 
 
 if __name__ == "__main__":

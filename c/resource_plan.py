@@ -166,14 +166,33 @@ def discover_gpus():
     return devices
 
 
+def _physical_cores_warn(message):
+    """Visibility for a mis-detected core count: a silent "1" here becomes
+    OMP_NUM_THREADS=1 and pins the whole run to a single core (#325). Emit on
+    stderr so it surfaces in the [PLAN]/[OMP] stream without being swallowed."""
+    print(f"[plan] warning: {message}", file=sys.stderr)
+
+
 def physical_cpu_count():
+    """Number of physical CPU cores (not SMT siblings).
+
+    Per-expert matmul regions are tiny and back-to-back; two SMT siblings share
+    one AVX-512 unit and contend, so logical (SMT) counts over-subscribe and
+    hurt throughput. We want true physical cores. A silent 1 here propagates to
+    OMP_NUM_THREADS=1 and pins the run to one core (#325), so every fallback
+    must be visible, never just ``or 1``.
+    """
     if sys.platform == "win32":
-        # os.cpu_count() conta i processori logici (SMT): 2 thread/core saturano
-        # le unita' AVX-512 e peggiorano il matmul. Contiamo i core fisici veri
-        # con GetLogicalProcessorInformationEx(RelationProcessorCore).
+        # Contiamo i core fisici veri con GetLogicalProcessorInformationEx
+        # (RelationProcessorCore). Le firme vanno dichiarate: su Python a 64 bit
+        # una WinAPI non dichiarata ritorna c_int (32 bit) e riceve i puntatori
+        # come c_int di default, quindi il probe puo' fallire silenziosamente.
         try:
             import ctypes
             k32 = ctypes.windll.kernel32
+            k32.GetLogicalProcessorInformationEx.argtypes = [
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            k32.GetLogicalProcessorInformationEx.restype = ctypes.c_int
             need = ctypes.c_ulong(0)
             k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
             buf = (ctypes.c_char * need.value)()
@@ -189,18 +208,62 @@ def physical_cpu_count():
                     off += size
                 if cores:
                     return cores
-        except (OSError, ValueError, AttributeError):
-            pass
+            _physical_cores_warn("GetLogicalProcessorInformationEx returned no cores")
+        except (OSError, ValueError, AttributeError) as error:
+            _physical_cores_warn(f"Windows core probe failed: {error}")
     try:
-        result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
+        # lscpu -p prepende SEMPRE la colonna CPU, quindi `-p=core,socket` emette
+        # in realta' "CPU,Core,Socket" (3 colonne). Dobbiamo leggere esplicitamente
+        # CPU/Core/Socket e deduplicare su (core, socket): contare le righe non
+        # deduplicate restituirebbe i thread logici (SMT) - l'errore originale.
+        # I campi vuoti ("-") marcano core/socket offline e non sono interi.
+        result = subprocess.run(["lscpu", "-p=CPU,Core,Socket"], text=True,
                                 capture_output=True, check=True, timeout=5)
-        cores = {tuple(map(int, line.split(","))) for line in result.stdout.splitlines()
-                 if line and not line.startswith("#")}
+        cores = set()
+        for line in result.stdout.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split(",")
+            if len(fields) < 3:
+                continue
+            try:
+                core, socket = int(fields[1]), int(fields[2])
+            except ValueError:
+                continue  # "-" per un core/socket offline
+            cores.add((core, socket))
         if cores:
             return len(cores)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return os.cpu_count() or 1
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        _physical_cores_warn(f"lscpu core probe failed: {error}")
+    logical = os.cpu_count()
+    if not logical:
+        _physical_cores_warn(
+            "could not detect any CPU cores; falling back to 1. "
+            "Set OMP_NUM_THREADS manually to fix single-core decode (#325).")
+        return 1
+    _physical_cores_warn(
+        f"physical-core probes unavailable; using {logical} logical CPUs "
+        f"(SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.")
+    return logical
+
+
+def _resolve_physical_cores(physical_cpus):
+    """Coerce the build_plan() physical-core argument to a sane positive int.
+
+    A None/0/None-ish value reaching here means physical_cpu_count() already
+    warned; clamp to 1 (so the engine always gets a positive team size) but keep
+    that clamp visible rather than silently masking it as the old ``max(1, int())``
+    did (#325)."""
+    try:
+        count = int(physical_cpus or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 1:
+        _physical_cores_warn(
+            "physical core count resolved to 0; defaulting to 1. "
+            "Set OMP_NUM_THREADS to fix single-core decode (#325).")
+        return 1
+    return count
 
 
 def cpu_socket_count():
@@ -366,7 +429,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "policy": {"name": policy, **POLICIES[policy],
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
-        "cpu": {"physical_cores": max(1, int(physical_cpus)),
+        "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
                 "sockets": max(1, int(cpu_sockets)),
                 "thread_policy": "physical-cores"},
         "tiers": {
