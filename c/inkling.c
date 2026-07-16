@@ -29,6 +29,7 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#include <sys/select.h>
 #endif
 #include "st.h"
 #include "tok.h"
@@ -1132,6 +1133,142 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     free(ids);
 }
 
+/* ---------- serve mode: openai_server.py engine protocol ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
+ *         CANCEL <id>\n
+ * stdout: READY sentinel once loaded, then per request a stream of
+ *         DATA <id> <size>\n<bytes>\n frames and a final
+ *         DONE <id> <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
+ * v1 semantics: requests run one at a time (SUBMITs arriving mid-generation
+ * queue up); the KV slot argument is accepted but every request re-prefills. */
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+static double rng_next(void) {
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+    return (double)(g_rng >> 11) / 9007199254740992.0;
+}
+
+/* temperature + top-p nucleus sampling; temp<=0 = greedy */
+typedef struct { float p; int i; } PI;
+static int pi_desc(const void *a, const void *b) {
+    float d = ((const PI*)b)->p - ((const PI*)a)->p;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+static int sample_logits(const float *logit, int n, float temp, float top_p) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    if (temp <= 0.f) return best;
+    PI *c = malloc((size_t)n * sizeof(PI));
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+        c[i].p = expf((logit[i] - logit[best]) / temp);
+        c[i].i = i; sum += c[i].p;
+    }
+    qsort(c, n, sizeof(PI), pi_desc);
+    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
+    double acc = 0; int k = 0;
+    while (k < n && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0;
+    int pick = c[0].i;
+    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+    free(c);
+    return pick;
+}
+
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define SRV_QMAX 16
+static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+
+static int stdin_readable(void) {
+    fd_set r; struct timeval tv = {0, 0};
+    FD_ZERO(&r); FD_SET(0, &r);
+    return select(1, &r, NULL, NULL, &tv) > 0;
+}
+
+/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static int serve_read_cmd(const char *cur_id) {
+    char ln[512];
+    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    char cmd[16], id[64];
+    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
+    if (!strcmp(cmd, "SUBMIT")) {
+        int slot, plen, max_tok; float temp, top_p;
+        if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 ||
+            plen < 0 || plen > (1<<22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        char *pl = malloc((size_t)plen + 1);
+        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        int nl = fgetc(stdin); (void)nl;
+        pl[plen] = 0;
+        if (g_qn < SRV_QMAX) {
+            SReq *q = &g_q[g_qn++];
+            snprintf(q->id, sizeof(q->id), "%s", id);
+            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+            q->payload = pl; q->plen = plen;
+        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    }
+    return 0;
+}
+
+static void serve_one(Model *m, Tok *T, SReq *q) {
+    Cfg *c = &m->c;
+    int cap = q->plen + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    state_reset(m);
+    kv_alloc(m, np + q->max_tok + 8);
+    double t0 = now_s();
+    uint64_t h0 = m->hits, m0 = m->miss;
+    float *logit = step(m, ids, np, 0, NULL);
+    int len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
+        free(logit); logit = NULL;
+        if (tk == c->eos) { limited = 0; break; }
+        int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+        printf("DATA %s %d\n", q->id, nb);
+        fwrite(buf, 1, (size_t)nb, stdout);
+        fputc('\n', stdout); fflush(stdout);
+        gen++; len++;
+        while (stdin_readable()) {
+            int r = serve_read_cmd(q->id);
+            if (r < 0) { free(ids); return; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+        if (cancelled || s == q->max_tok - 1) break;
+        logit = step(m, &tk, 1, len - 1, NULL);
+    }
+    free(logit);
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits - h0 + m->miss - m0);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    fflush(stdout);
+    free(ids);
+}
+
+static void serve_loop(Model *m, Tok *T) {
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
+    else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
+    /* the gateway reads a STAT line right after the READY sentinel (glm
+     * reports its load stats there) — match the handshake */
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        SReq q = g_q[0];
+        memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
+        serve_one(m, T, &q);
+        free(q.payload);
+    }
+}
+
 /* ---------- ref_inkling.json harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -1175,16 +1312,19 @@ int main(int argc, char **argv) {
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
     }
-    if (cap < 0) cap = (prompt || pfile) ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
+    int serve = getenv("SERVE") && *getenv("SERVE") == '1';
+    if (cap < 0) cap = (prompt || pfile || serve) ? 0 : 16;   /* generate/serve default to RAM-sized auto cap */
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
 
-    if (prompt || pfile) {
+    if (prompt || pfile || serve) {
         Model m; model_init(&m, snap, cap, bits);
-        printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
-               m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", m.cache[0].cap);
+        if (!serve)
+            printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
+                   m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", m.cache[0].cap);
         pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
+        if (serve) { serve_loop(&m, &T); usage_save(&m, snap); return 0; }
         if (prompt) generate_stream(&m, &T, prompt, n_new);
         else {   /* -f: one prompt per line, model loaded once, usage accumulates */
             FILE *pf = fopen(pfile, "rb"); if (!pf) { perror(pfile); return 1; }

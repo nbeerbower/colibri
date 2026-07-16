@@ -284,6 +284,52 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
+ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
+
+
+def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                        tool_choice=None):
+    """Text-only subset of Inkling's chat_template.jinja: role tokens with
+    <|content_text|> parts and <|end_message|> terminators, an assistant
+    <|content_model_end_sampling|> after each prior model turn, the
+    thinking-effort hint appended after the messages (the template's fallback
+    branch), then <|message_model|> as the generation prompt."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Inkling engine yet.",
+                       "tools", "unsupported_parameter")
+    role_token = {"user": "<|message_user|>", "system": "<|message_system|>",
+                  "developer": "<|message_system|>", "assistant": "<|message_model|>",
+                  "tool": "<|message_tool|>"}
+    prompt = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        rtok = role_token.get(role)
+        if rtok is None:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
+        if role == "assistant":
+            prompt.append("<|content_model_end_sampling|>")
+    # Thinking effort: template default is 0.9, but at single-machine decode
+    # speeds unrequested thinking is mostly latency — default low unless the
+    # client asks (reasoning_effort) or sets enable_thinking.
+    effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7,
+                  "high": 0.9, "max": 0.99}
+    if reasoning_effort in effort_map:
+        eff = effort_map[reasoning_effort]
+    else:
+        eff = 0.9 if enable_thinking else 0.2
+    prompt.append(f"<|message_system|><|content_text|>Thinking effort level: "
+                  f"{0 if eff == 0.0 else eff}<|end_message|>")
+    prompt.append("<|message_model|>")
+    return "".join(prompt)
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
@@ -1067,7 +1113,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+        renderer = render_chat_inkling if ARCH == "inkling" else render_chat
+        prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                              body.get("tool_choice"))
         self.generation(body, prompt, request_id, True)
 
@@ -1120,9 +1167,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
+                        help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
@@ -1133,6 +1182,16 @@ def main():
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
     args = parser.parse_args()
+    global ARCH
+    ARCH = args.arch
+    if ARCH == "auto":
+        try:
+            with open(Path(args.model) / "config.json") as fh:
+                ARCH = "inkling" if "inkling" in (json.load(fh).get("model_type") or "") else "glm"
+        except OSError:
+            ARCH = "glm"
+    if args.model_id is None:
+        args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
