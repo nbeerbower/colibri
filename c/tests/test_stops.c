@@ -65,7 +65,11 @@ static int expect(const char *what, int id, int want){
 
 int main(void){
     int fail=0;
-    char dir[]="/tmp/coli_stops_XXXXXX";
+    /* Relative to the CWD, like test_compat_direct's TMPF — NOT "/tmp/...".
+     * These binaries are built by MinGW into native Windows .exe files, which
+     * resolve Windows paths: "/tmp" is not one, so mkdtemp there fails ENOENT
+     * and the whole `make check` goes red on the windows job (and only there). */
+    char dir[]="test_stops_XXXXXX";
     if(!mkdtemp(dir)){ perror("mkdtemp"); return 1; }
     write_tok(dir);
     char tkp[512]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",dir);
