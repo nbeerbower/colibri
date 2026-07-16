@@ -382,14 +382,31 @@ static float load_scalar(Model *m, const char *name, float dflt) {
     float v; st_read_f32(&m->S, name, &v, 0); return v;
 }
 
+/* chunked pread: a single pread caps at ~2.1 GB on Linux, and the bf16
+ * embed/lm_head tensors are 2.47 GB — loop in 1 GB slices */
+static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
+    char *p = buf;
+    while (nb > 0) {
+        int64_t chunk = nb < (1<<30) ? nb : (1<<30);
+        ssize_t got = pread(fd, p, (size_t)chunk, off);
+        if (got <= 0) { perror("pread chunk"); exit(1); }
+        p += got; off += got; nb -= got;
+    }
+}
+
 /* big matmul weights keep their on-disk dtype resident: BF16 raw (real
  * checkpoint, halves RAM), anything else as f32 (tiny oracle: bit-exact) */
 static Wt load_w(Model *m, const char *name) {
     Wt w = {0};
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
-    if (t->dtype == 0) { w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); } st_read_raw(&m->S, name, w.h, 0); }
-    else               { w.f = falloc(t->numel); st_read_f32(&m->S, name, w.f, 0); }
+    if (t->dtype == 0) {
+        w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); }
+        pread_all(t->fd, w.h, t->nbytes, t->off);
+    } else {
+        w.f = falloc(t->numel);
+        st_read_f32(&m->S, name, w.f, 0);
+    }
     return w;
 }
 static Wt wt_off(Wt w, int64_t off) {
