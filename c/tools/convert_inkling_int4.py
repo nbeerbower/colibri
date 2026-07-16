@@ -133,8 +133,12 @@ def map_name(name):
 # ---------- per-shard conversion ----------
 
 def quantize_expert_tensor(f, name, xbits, out, out_name):
-    """Chunked (per-expert) de-interleave/quantize of the fused 3D expert
-    tensors, so peak RAM stays at one expert slice, not one 19 GB tensor."""
+    """Per-expert de-interleave/quantize of the fused 3D expert tensors.
+    Slice reads stay sequential (kind to the HDD); the numpy quantization —
+    the CPU bottleneck, ~95% of the checkpoint flows through here — fans out
+    on a thread pool (ufuncs release the GIL on large arrays). Waves of 16
+    keep peak RAM at ~1.2 GB of pending slices instead of the whole tensor."""
+    from concurrent.futures import ThreadPoolExecutor
     sl = f.get_slice(name)
     E, R, C = sl.get_shape()             # w13: [E,2I,D] (interleaved), w2: [E,D,I]
     is_w13 = name.endswith("w13_weight")
@@ -143,14 +147,20 @@ def quantize_expert_tensor(f, name, xbits, out, out_name):
     else:
         qs = np.empty((E * R, C), np.uint8)
     sc = np.empty(E * R, np.float32)
-    for e in range(E):
-        w = sl[e]                        # [R, C] bf16
+
+    def work(e, w):
         if is_w13:
             w = deinterleave(w, 0)       # -> [gate rows; up rows]
         w = w.float().numpy()
         q, s = quant_int4_rows(w) if xbits == 4 else quant_int8_rows(w)
         qs[e * R:(e + 1) * R] = q
         sc[e * R:(e + 1) * R] = s
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for base in range(0, E, 16):
+            futs = [ex.submit(work, e, sl[e]) for e in range(base, min(base + 16, E))]
+            for fu in futs:
+                fu.result()
     out[out_name] = torch.from_numpy(qs.reshape(-1))
     out[out_name + ".qs"] = torch.from_numpy(sc)
 
