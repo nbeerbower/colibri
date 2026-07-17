@@ -67,7 +67,7 @@
             # `import openai_server` / `resource_plan` / `doctor` resolve.
             makeWrapper ${pythonEnv}/bin/python $out/bin/coli \
               --add-flags "$out/lib/colibri/coli" \
-              --set COLI_ENGINE "$out/lib/colibri/glm" \
+              --set-default COLI_ENGINE "$out/lib/colibri/glm" \
               --set PYTHONPATH "$out/lib/colibri:${pythonEnv}/${pkgs.python3.sitePackages}"
             runHook postInstall
           '';
