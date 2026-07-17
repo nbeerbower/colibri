@@ -363,6 +363,29 @@ test-python:
 
 test: test-c test-python
 
+# --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
+# The tiny-model assertions live in test_inefficiency.py and run as part of
+# test-python (they're discovered by the test_*.py glob). These targets are
+# convenience entry points; the opt-in full-model report is NEVER in `make test`.
+#
+#   make efficiency        tiny-model asserted regression tests (CPU; part of test-python)
+#   make efficiency-cuda   the CUDA-path tests (requires a CUDA build — see below)
+#   make efficiency-report opt-in full-model 🟢/🔴 diagnostic, never fails CI
+#
+# CUDA build (Windows): the CUDA tests need a host built with -DCOLI_CUDA plus
+# the runtime DLL. Do this FIRST — note CUDA_DLL=1 on BOTH the host and the
+# rule below, or `make glm.exe` will rebuild a CPU-only host and overwrite it:
+#   make clean && make glm.exe CUDA_DLL=1 && make cuda-dll
+# The tests auto-skip with a clear message if the host is CPU-only.
+efficiency: test-python
+	$(PYTHON) -m unittest tests.test_inefficiency -v
+
+efficiency-cuda:
+	$(PYTHON) -m unittest tests.test_inefficiency.TinyCudaEfficiencyTest -v
+
+efficiency-report:
+	$(PYTHON) tests/test_efficiency_report.py
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
