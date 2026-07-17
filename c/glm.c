@@ -1732,8 +1732,14 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     while(got<n){
         ssize_t r=pread(fd, p+got, (size_t)(n-got), off+got);
         if(r<0){ if(errno==EINTR) continue;
+#ifdef _WIN32
+            fprintf(stderr,"%s: %s (off %lld, %lld/%lld bytes, WinErr=%lu)\n",tag,strerror(errno),
+                    (long long)off,(long long)got,(long long)n,(unsigned long)compat_pread_lasterr);
+#else
             fprintf(stderr,"%s: %s (off %lld, %lld/%lld bytes)\n",tag,strerror(errno),
-                    (long long)off,(long long)got,(long long)n); return -1; }
+                    (long long)off,(long long)got,(long long)n);
+#endif
+            return -1; }
         if(r==0){ fprintf(stderr,"%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated shard?\n",
                     tag,(long long)off,(long long)got,(long long)n); return -1; }
         got+=r;
