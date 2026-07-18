@@ -10,6 +10,8 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
+c/colibri
+c/colibri.exe
 c/glm
 c/glm.exe
 c/olmoe
