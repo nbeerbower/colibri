@@ -38,6 +38,7 @@ typedef struct {
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
+    cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
@@ -1293,6 +1294,106 @@ extern "C" int coli_cuda_pipe_router(int device,const float *x_dev,
     memcpy(w_host,buf+Ksel*sizeof(int),(size_t)Ksel*sizeof(float));
     memcpy(keff_host,buf+Ksel*(sizeof(int)+sizeof(float)),sizeof(int));
     return 1;
+}
+/* ---- resident expert-group accumulation (#431 PR-C0) ----------------------
+ * Decode-time (S=1) expert groups without the host round-trip: the input row
+ * is P2P'd from the layer's home device, the group runs through the grouped-W4
+ * kernels on its own stream, the down-projection outputs are weighted and
+ * reduced ON DEVICE (fixed expert order), and the device's partial sum is
+ * peer-pushed into a per-issue slot on the home device. take() makes the home
+ * legacy stream wait on every issue event and reduces the slots in issue order
+ * — deterministic, no atomics, no host bytes. The CPU tier overlaps with all
+ * of it exactly as before. */
+__global__ static void bcast_row(float *dst,const float *src,int count,int D){
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<D;i+=gridDim.x*blockDim.x){
+        float v=src[i];
+        for(int c=0;c<count;c++) dst[(size_t)c*D+i]=v;
+    }
+}
+__global__ static void weighted_sum_rows(float *out,const float *y,const float *w,
+                                         int count,int D){
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<D;i+=gridDim.x*blockDim.x){
+        float acc=0.f;
+        for(int c=0;c<count;c++) acc+=w[c]*y[(size_t)c*D+i];   /* fixed order */
+        out[i]=acc;
+    }
+}
+__global__ static void sum_slots(float *dst,const float *slots,int n,int D){
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<D;i+=gridDim.x*blockDim.x){
+        float acc=0.f;
+        for(int s=0;s<n;s++) acc+=slots[(size_t)s*D+i];        /* issue order */
+        dst[i]=acc;
+    }
+}
+extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gates,
+        ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
+        const float *weights, int count,
+        int home_device, const float *x_src_dev, float *partial_slot_dev){
+    if(!gates||!ups||!downs||!weights||count<1||count>64||!x_src_dev||!partial_slot_dev) return 0;
+    ColiCudaTensor *first=gates[0]; if(!first) return 0;
+    int device=first->device,D=first->I,I=first->O;
+    GroupDesc host[64];
+    int total=0,all_s4=1;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
+        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
+                 g->fmt,u->fmt,d->fmt,1,total};
+        all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        total++;
+    }
+    if(!all_s4) return 0;                       /* resident path: per-row int4 only */
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    if(!ctx->ev_done_ok){
+        if(!cuda_ok(cudaEventCreateWithFlags(&ctx->ev_done,cudaEventDisableTiming),
+                    "resident group event")) return 0;
+        ctx->ev_done_ok=1;
+    }
+    /* size for the 64-expert cap, not for `count`: reserve() reallocs on growth,
+     * and a realloc here could free a buffer the PREVIOUS layer's still-queued
+     * async work on this stream reads. Fixed caps make re-issue realloc-free. */
+    size_t xb=(size_t)64*D*sizeof(float), ib=(size_t)64*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve(&ctx->ac,&ctx->ac_cap,(size_t)(D+64)*sizeof(float))||
+       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)64*sizeof(GroupDesc)))
+        return 0;
+    float *w_dev=ctx->ac+D, *partial_local=ctx->ac;
+    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
+                                cudaMemcpyHostToDevice,ctx->stream),"resident group desc")||
+       !cuda_ok(cudaMemcpyAsync(w_dev,weights,(size_t)count*sizeof(float),
+                                cudaMemcpyHostToDevice,ctx->stream),"resident group weights"))
+        return 0;
+    /* input row: P2P from the home device. The caller guarantees x_src_dev is
+     * materialized (the pre-moe nrm download already synced the home stream). */
+    if(!cuda_ok(cudaMemcpyPeerAsync(ctx->x,device,x_src_dev,home_device,
+                                    (size_t)D*sizeof(float),ctx->stream),"resident group x p2p"))
+        return 0;
+    bcast_row<<<64,256,0,ctx->stream>>>(ctx->x,ctx->x,count,D);   /* row 0 -> rows 1..count-1 (in-place safe: row 0 rewritten with itself) */
+    GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+    dim3 hg((unsigned)I,1,(unsigned)count),og((unsigned)D,1,(unsigned)count);
+    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+    silu_mul<<<(unsigned)(((size_t)count*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)count*I);
+    grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    weighted_sum_rows<<<48,256,0,ctx->stream>>>(partial_local,ctx->y,w_dev,count,D);
+    if(!cuda_ok(cudaMemcpyPeerAsync(partial_slot_dev,home_device,partial_local,device,
+                                    (size_t)D*sizeof(float),ctx->stream),"resident partial p2p"))
+        return 0;
+    if(!cuda_ok(cudaEventRecord(ctx->ev_done,ctx->stream),"resident event record")) return 0;
+    return cuda_ok(cudaGetLastError(),"resident group launch");
+}
+extern "C" int coli_cuda_expert_group_resident_take(int home_device,const int *devices,int n_issued,
+                                           float *slots_dev,float *acc_dev,int D){
+    if(n_issued<1||!slots_dev||!acc_dev||D<1) return 0;
+    DeviceContext *home=find_ctx(home_device); if(!select_ctx(home)) return 0;
+    for(int i=0;i<n_issued;i++){
+        DeviceContext *src=find_ctx(devices[i]);
+        if(!src||!src->ev_done_ok) return 0;
+        if(!cuda_ok(cudaStreamWaitEvent(0,src->ev_done,0),"resident take wait")) return 0;
+    }
+    sum_slots<<<48,256>>>(acc_dev,slots_dev,n_issued,D);          /* legacy stream: ordered with pipe_* */
+    return cuda_ok(cudaGetLastError(),"resident take reduce");
 }
 extern "C" int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                                      int spitch,int width,int height){

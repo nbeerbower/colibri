@@ -1913,6 +1913,13 @@ static int g_absorb=-1;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 static int g_cuda_router=0; /* COLI_CUDA_ROUTER=1 (#431 PR-A): router on the layer home device at decode */
+static int g_cuda_resid=0;  /* COLI_CUDA_RESID=1 (#431 PR-C0): expert-group results stay on device */
+/* pipe -> moe handoff for the resident group path (set per layer by
+ * pipe_layer_sparse, consumed by moe()'s group dispatch, cleared after take) */
+static int g_pres_home=-1;                /* home device, -1 = path off        */
+static const float *g_pres_xsrc;          /* nrm_d on the home device          */
+static float *g_pres_slots;               /* [ndev][D] partial slots on home   */
+static int g_pres_used[COLI_CUDA_MAX_DEVICES], g_pres_nused;
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
 static int cmp_fdesc(const void *a,const void *b){
@@ -3085,14 +3092,31 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
         }
         if(!async_done)
+        /* resident path (#431 PR-C0): issue the group on its device with the input
+         * P2P'd from the home device and the weighted partial pushed back there —
+         * no host bytes, no per-device sync; take() runs after moe() returns.
+         * Issue is serial (it only queues async work); failure falls back to the
+         * synchronous host-round-trip call below, per device. */
+        if(g_pres_home>=0 && S==1){
+            for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
+                float wbuf[64];
+                for(int q=0;q<dev_nc[di];q++) wbuf[q]=group_weight[(int64_t)dev_which[di][q]*S];
+                if(coli_cuda_expert_group_resident_issue(dev_g[di],dev_u[di],dev_d[di],wbuf,dev_nc[di],
+                        g_pres_home,g_pres_xsrc,g_pres_slots+(int64_t)g_pres_nused*D)){
+                    g_pres_used[g_pres_nused++]=g_cuda_devices[di];
+                    dev_ok[di]=2;                       /* handled on device: skip host collection */
+                }
+            }
+        }
         #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
-        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
+        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]&&dev_ok[di]!=2){
             double td=g_prof?now_s():0;
             dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
                 group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
             if(g_prof)dev_time[di]=now_s()-td;
         }
         for(int di=0;di<g_cuda_ndev;di++){
+            if(dev_ok[di]==2) continue;               /* results live on the home device (#431 PR-C0) */
             int off=dev_off[di];
             for(int q=0;q<dev_nc[di];q++){
                 int gi=dev_which[di][q],nr=group_n[gi]; ESlot *e=group_e[gi];
@@ -3631,8 +3655,29 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
     if(dev_routed){ g_pre_idx=lr_idx; g_pre_w=lr_w; g_pre_keff=lr_keff; }
+    float *res_acc=NULL;
+    if(g_cuda_resid && S==1){
+        g_pres_slots=coli_cuda_pipe_scratch(dev,25,(size_t)g_cuda_ndev*D*sizeof(float));
+        res_acc     =coli_cuda_pipe_scratch(dev,26,(size_t)D*sizeof(float));
+        if(g_pres_slots && res_acc){ g_pres_home=dev; g_pres_xsrc=nrm_d; g_pres_nused=0; }
+        else { g_pres_slots=NULL; res_acc=NULL; }
+    }
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
     if(dev_routed){ g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; }
+    if(g_pres_home>=0){
+        int nused=g_pres_nused; g_pres_home=-1; g_pres_xsrc=NULL;
+        if(nused>0){
+            /* partials are in flight toward our slots; take() orders the legacy
+             * stream behind every issue event and reduces in issue order. A
+             * failure here would silently drop routed experts — that is a wrong
+             * answer, not a slow one, so it is fatal by design. */
+            if(!coli_cuda_expert_group_resident_take(dev,g_pres_used,nused,g_pres_slots,res_acc,D)||
+               !coli_cuda_pipe_add(dev,x_dev,res_acc,(size_t)D)){
+                fprintf(stderr,"[CUDA] resident expert take failed — refusing to drop routed experts\n");
+                exit(1);
+            }
+        }
+    }
     te=now_s();
     if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
@@ -5883,6 +5928,7 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     g_cuda_router=getenv("COLI_CUDA_ROUTER")?atoi(getenv("COLI_CUDA_ROUTER")):0;
+    g_cuda_resid=getenv("COLI_CUDA_RESID")?atoi(getenv("COLI_CUDA_RESID")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
