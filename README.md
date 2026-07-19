@@ -44,6 +44,16 @@ brightness is routing heat, and every expert routed in a turn flashes white. Hov
 as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
 (poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
 
+## The vision
+
+Frontier models should not be sealed inside datacenters. colibrì exists so that
+**anyone curious enough can open one up**: run a 744B-parameter mind on hardware
+you already own, watch every expert fire in real time, and change the code that
+does it. Not renting intelligence behind an API — *holding* it: probing it,
+measuring it, improving it. Every optimisation in this project started with
+someone measuring something on their own machine; the engine is deliberately
+small enough that the next one can come from you.
+
 ## The idea
 
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
@@ -60,6 +70,18 @@ So the model doesn't need to *fit* in fast memory — it needs to be **placed**:
 - the **19,456 routed experts** (75 MoE layers × 256 + the MTP head, ~19 MB each
   at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a
   per-layer LRU cache, a learned pinned hot-store, and an optional VRAM tier.
+
+Think of the core algorithm as **a JIT, but for weights**. A compiler JIT never
+compiles the whole program — it watches what actually runs and compiles the hot
+paths, just in time. colibrì makes the same bet about a 744B parameter space:
+parameters are not resident state to be held, they are **data to be staged**
+across a heterogeneous storage hierarchy (VRAM / RAM / NVMe), exactly when the
+router proves they are needed. Measured routing heat decides which experts earn
+which tier, the router runs a layer ahead so prefetch hides the staging latency,
+and — like a JIT — the engine learns your workload: the more you run, the hotter
+the right experts get. It works because routing has measurable structure (see
+the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
+structure is cacheable.
 
 The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
 at runtime, no GPU required.
@@ -204,6 +226,18 @@ install from the clone, not a standalone wheel).
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
+## What's next
+
+- **Algorithmic research is active.** The current hierarchy is LRU + a learned
+  pin set; the next step is under way — smarter placement and scheduling,
+  overlap of CPU and GPU expert execution, and routing-aware speculation.
+  Everything lands the way this project always works: measured, reviewed, and
+  merged in the open.
+- **More open models.** The tiering algorithm is model-agnostic: any MoE with
+  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
+  support for more open-weight families — **Kimi K2** (Moonshot AI),
+  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+
 ## Supporting the project
 
 colibrì started as a one-person project on a 12-core laptop with 25 GB of RAM;
@@ -243,6 +277,14 @@ delegate to the engine Makefile.
 The hummingbird weighs a few grams, hovers in place, and visits a thousand
 flowers a day. This engine keeps a 744-billion-parameter giant alive on
 hummingbird rations: 25 GB of RAM, twelve CPU cores, and a lot of disk patience.
+
+## Acknowledgements
+
+colibrì is an engine; the minds it runs are a gift. Thank you to the teams
+releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
+(Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
+contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
+This project is proof of what open weights make possible.
 
 ## License
 
