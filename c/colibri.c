@@ -94,7 +94,13 @@ typedef struct {
  *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
+/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64.
+ * q4 ospita int4/int2/int3 packed. fmt=4 (grouped int4, #242): per-row nibbles + one f32
+ * scale per group of `gs` inputs (s has O*ceil(I/gs) entries).
+ * fmt=5 (int3, per-GROUP scales, group=64, see quant.h I3_*): values in [-4,3] stored per
+ * 64-input group as 24 bytes = 16B low plane (2 bits/val, int2 layout) + 8B high plane
+ * (1 bit/val), plus ONE f32 scale PER GROUP (s has O*ceil(I/64) entries, not O). 3.5
+ * bits/weight effective — the quality/size sweet spot measured in the #132 ablation. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
@@ -110,6 +116,10 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     if(t->fmt==4){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
         int ng=(t->I+t->gs-1)/t->gs;
         return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
+    if(t->fmt==5){ /* int3-g64: 24B/group weights + one f32 scale per group (I3_* in quant.h,
+                    * included below — keep the arithmetic literal here) */
+        int64_t ng=((int64_t)t->I+63)/64;
+        return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
@@ -267,6 +277,7 @@ static void qt_cuda_reset(QT *t){
     t->cuda_failed=0;
 }
 static int qt_cuda_upload(QT *t){
+    if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
@@ -445,7 +456,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
@@ -467,6 +478,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
+    else if(w->fmt==5) matmul_i3(y,x,w->q4,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
@@ -659,18 +671,21 @@ static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' 
 static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can load a layer concurrently */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
-/* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
+/* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
-    else if(bits>=3){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
+    else if(bits>=4){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
+    else if(bits==3){ t->fmt=5; t->q4=qalloc((int64_t)O*i3_rowbytes(I));
+                      t->s=(float*)qalloc((size_t)O*i3_groups(I)*sizeof(float)); }
     else { t->fmt=3; t->q4=qalloc((int64_t)O*((I+3)/4)); t->s=qsalloc(O); }
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
     else if(t->fmt==1) quantize_rows(w, t->q8, t->s, t->O, t->I, bits);
     else if(t->fmt==3) pack_int2(w, t->q4, t->s, t->O, t->I, bits);
+    else if(t->fmt==5) pack_int3_g64(w, t->q4, t->s, t->O, t->I);
     else pack_int4(w, t->q4, t->s, t->O, t->I, bits);
 }
 
@@ -840,16 +855,22 @@ static int detect_group_size(int O, int I, int64_t ns){
  * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
- * si termina invece di sforare. Ritorna fmt (1/2/3/4) e scrive *gs. */
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4/5) e scrive *gs. */
 static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
-    int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : 0;
+    int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
+    /* Row formats take precedence: for tiny I the int3-g64 byte count can coincide with
+     * a row layout (e.g. [O,48]: ceil(48/2)=24=1*24). For real tensor shapes the counts
+     * are distinct, and the weight bytes — not the scale size — are the int3 tag, because
+     * int3-g64 and grouped-int4-at-gs=64 carry the SAME scale cardinality O*ceil(I/64). */
+    int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : (nb==exp_i3)?5 : 0;
     if(!fmt){
-        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2 layout for [%d,%d], refusing (untrusted container)\n",
+        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64 layout for [%d,%d], refusing (untrusted container)\n",
                 name,(long long)nb,O,I); exit(1); }
     *gs=0;
     if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
-    int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs)) : (int64_t)O;   /* in FLOAT */
+    int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
+                      : (fmt==5)? (int64_t)O*i3_groups(I) : (int64_t)O;   /* in FLOAT */
     if(ns != exp_scale*4){
         fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
                 name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
@@ -872,6 +893,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            st_read_raw(&m->S,name,t->q4,drop); }
+        else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
+            if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
@@ -1103,6 +1127,13 @@ static void embed_row(Model *m, int tok, float *x){
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
         for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
             if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
+        return; }
+    if(e->fmt==5){ const uint8_t *q=e->q4+(int64_t)tok*i3_rowbytes(D);   /* int3-g64 */
+        const float *sr=e->s+(int64_t)tok*i3_groups(D); int64_t ng=i3_groups(D);
+        for(int64_t g=0; g<ng; g++){ const uint8_t *lo=q+g*I3_GBYTES, *hi=lo+16;
+            int base=(int)(g*I3_GROUP), n=D-base<I3_GROUP?D-base:I3_GROUP;
+            for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
+                x[base+k]=(float)((int)u-4)*sr[g]; } }
         return; }
     const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
@@ -1598,8 +1629,11 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     for(int k=0;k<3;k++){
         fp[k]=s->fslab+fo; fo+=l->tq[k]->nbytes/4;
         int64_t nb=l->tw[k]->nbytes;
-        int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
+         * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
+        int gs=0;
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs);
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
     if(publish_eid) s->eid=l->eid;
@@ -1830,6 +1864,14 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
             acc[i]  +=coef*scl[i/gs]    *((int)(b&0xF)-8);
             acc[i+1]+=coef*scl[(i+1)/gs]*((int)(b>>4)-8); }
         if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=coef*scl[(I-1)/gs]*((int)(b&0xF)-8); } return; }
+    /* fmt=5 likewise before c: int3-g64 scales are per-GROUP [O,ng], not s[row] */
+    if(t->fmt==5){ const uint8_t *w=t->q4+(int64_t)row*i3_rowbytes(I);
+        const float *sr=t->s+(int64_t)row*i3_groups(I); int64_t ng=i3_groups(I);
+        for(int64_t g=0; g<ng; g++){ const uint8_t *lo=w+g*I3_GBYTES, *hi=lo+16;
+            float cg=coef*sr[g]; int base=(int)(g*I3_GROUP), n=I-base<I3_GROUP?I-base:I3_GROUP;
+            for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
+                acc[base+k]+=cg*(float)((int)u-4); } }
+        return; }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
@@ -1855,6 +1897,13 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
                 for(int i=base;i<end;i++){ uint8_t b=w[i>>1];
                     acc+=(float)((i&1)?((int)(b>>4)-8):((int)(b&0xF)-8))*x[i]; }
                 a+=(double)acc*scl[g]; } }
+        else if(t->fmt==5){ const uint8_t *w=t->q4+(int64_t)row*i3_rowbytes(I);
+            const float *sr=t->s+(int64_t)row*i3_groups(I); int64_t ng=i3_groups(I);
+            for(int64_t g=0; g<ng; g++){ const uint8_t *lo=w+g*I3_GBYTES, *hi=lo+16;
+                int base=(int)(g*I3_GROUP), n=I-base<I3_GROUP?I-base:I3_GROUP; float acc=0;
+                for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
+                    acc+=(float)((int)u-4)*x[base+k]; }
+                a+=(double)(acc*sr[g]); } }
         else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
         y[j]=(float)a;
