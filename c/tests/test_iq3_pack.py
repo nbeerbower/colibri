@@ -9,10 +9,17 @@ import os
 import sys
 import unittest
 
-import numpy as np
+# The runtime path is dependency-free by design and CI keeps it that way, so the
+# offline-tooling tests skip rather than fail where numpy is absent.
+np = None
+P = None
+try:
+    import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
-import iq3_pack as P  # noqa: E402
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import iq3_pack as P
+except ImportError:  # pragma: no cover - exercised only on dependency-free CI
+    pass
 
 
 def ref_decode(packed, K):
@@ -43,6 +50,7 @@ def ref_decode(packed, K):
     return out
 
 
+@unittest.skipIf(P is None, "numpy not available (offline-tooling test)")
 class TestIq3Pack(unittest.TestCase):
     def setUp(self):
         np.random.seed(4242)
