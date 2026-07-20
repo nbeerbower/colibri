@@ -82,6 +82,7 @@ Format: `VAR` — default — effect.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `COLI_MODEL_DIRS` | unset | SPLIT the model across 2+ drives: a `;`/`,`-separated list of extra directories, each holding a **distinct** subset of the `.safetensors` shards (no duplication). Shards act as a search path — every shard is read from whichever drive holds it, so concurrent expert loads parallelise across drives and combined capacity is used. Scales to N drives. Metadata (config/tokenizer/`.coli_usage`) stays in the primary `COLI_MODEL` dir. Pairs well with `PIPE=1` (concurrent loaders) + `DIRECT=1`. Distinct from — and composable with — `COLI_MODEL_MIRROR`: the mirror is matched per-shard by basename against the merged (split) index, so a mirror dir may hold a copy of any subset of the split's shards. |
 | `COLI_MODEL_MIRROR` | unset | Path to a second, byte-identical (read-only) copy of the model on another drive; expert reads are split across both. Partial mirrors work (only the shards present are used). |
 | `COLI_DISK_WEIGHTS` | unset (startup bandwidth probe) | Split ratio `<primary>,<mirror>` (e.g. `1,1` for 50/50, `9,3` for a fast+slow pair). Unset = probe both drives with the engine's own access pattern at startup. |
 

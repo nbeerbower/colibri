@@ -210,21 +210,66 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
-static void st_init(shards *S, const char *snap_dir) {
+/* Scan one directory for *.safetensors shards, appending to files[] (dedup by
+ * basename, so a list of directories acts as a SEARCH PATH: the same shard
+ * present on two drives is taken from the first-listed one only). *added
+ * returns how many shards this dir contributed. */
+static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
+    DIR *d = opendir(dir); struct dirent *e;
+    if (!d) { perror(dir); exit(1); }
+    int base_n = *nf;
+    while ((e = readdir(d))) {
+        const char *dot = strrchr(e->d_name, '.');
+        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
+            int dup = 0;
+            for (int i = 0; i < *nf; i++) {
+                const char *b = strrchr(files[i], '/');
+#ifdef _WIN32
+                const char *b2 = strrchr(files[i], '\\'); if (b2 && (!b || b2 > b)) b = b2;
+#endif
+                b = b ? b + 1 : files[i];
+                if (!strcmp(b, e->d_name)) { dup = 1; break; }  /* already taken from a higher-priority drive */
+            }
+            if (dup) continue;
+            if (*nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            snprintf(files[(*nf)++], 1024, "%s/%s", dir, e->d_name);
+        }
+    }
+    closedir(d);
+    if (added) *added = *nf - base_n;
+}
+
+/* Index shards from snap_dir, optionally SPLIT across extra drives listed in
+ * extra_dirs (';' or ',' separated). Each shard lives on exactly ONE drive
+ * (no duplication — unlike the dual-SSD mirror); a demand pread hits whichever
+ * drive holds that shard, so concurrent expert loads parallelise across drives
+ * and combined capacity is used. Scales to N drives. Metadata (config /
+ * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
+static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
-    DIR *d = opendir(snap_dir); struct dirent *e;
-    if (!d) { perror(snap_dir); exit(1); }
-    while ((e = readdir(d))) {
-        const char *dot = strrchr(e->d_name, '.');
-        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
-            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
-            snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
+    int c0 = 0; st_scan_dir(snap_dir, files, &nf, &c0);
+    int ndir = 1;
+    if (extra_dirs && *extra_dirs) {
+        char buf[4096]; snprintf(buf, sizeof(buf), "%s", extra_dirs);
+        char *p = buf;
+        while (p && *p) {
+            char *sep = p; while (*sep && *sep != ';' && *sep != ',') sep++;
+            int last = (*sep == 0); *sep = 0;
+            while (*p == ' ') p++;
+            size_t plen = strlen(p); while (plen > 0 && p[plen-1] == ' ') p[--plen] = 0;
+            if (*p) {
+                int cN = 0; st_scan_dir(p, files, &nf, &cN);
+                fprintf(stderr, "[SPLIT] +%s -> %d shard(s)\n", p, cN);
+                ndir++;
+            }
+            p = last ? NULL : sep + 1;
         }
+        fprintf(stderr, "[SPLIT] model across %d dir(s): %d shard(s) total (primary %s -> %d shard(s)), no duplication\n",
+                ndir, nf, snap_dir, c0);
     }
-    closedir(d);
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
 
@@ -304,6 +349,9 @@ static void st_init(shards *S, const char *snap_dir) {
         S->hidx[h] = i;
     }
 }
+
+/* backward-compatible single-directory entry point */
+static void st_init(shards *S, const char *snap_dir) { st_init_multi(S, snap_dir, NULL); }
 
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {

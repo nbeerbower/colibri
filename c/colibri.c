@@ -1031,7 +1031,9 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
-    load_cfg(&m->c,snap); st_init(&m->S,snap);
+    load_cfg(&m->c,snap);
+    { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
+      st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
