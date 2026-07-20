@@ -4331,16 +4331,21 @@ static void rss_guard(Model *m){
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
             ESlot *s=&m->ecache[l][lru];
             s->eid=-1;                                    /* nascosto: nessun hit/evict altrui */
-            pthread_mutex_unlock(&g_pilot_mx);
             int64_t sb=s->slab_cap + s->fslab_cap*4;
 #ifdef COLI_METAL
             if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
 #endif
+            /* La free resta SOTTO g_pilot_mx. Sbloccando prima, lo slot e' visibile come
+             * {eid=-1, slab ancora valido}: il pilota (pilot_realload) riusa per primo gli
+             * slot eid==-1, quindi puo' prenderlo e fare pread dentro lo slab MENTRE lo
+             * liberiamo -> use-after-free / double-free. Slab valido e slot riusabile
+             * devono restare mutuamente esclusivi finche' il puntatore non e' NULL. */
             compat_aligned_free(s->slab); free(s->fslab);
             s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
             QT *q[3]={&s->g,&s->u,&s->d};
             for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
             s->used=0;                                    /* primo candidato al riuso */
+            pthread_mutex_unlock(&g_pilot_mx);
             freed += sb; dropped++;
         }
         if(m->ecap>2) m->ecap--;                           /* il tetto scende: niente ricrescita */
