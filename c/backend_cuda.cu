@@ -638,6 +638,12 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int device) {
     if (fault_injected()) return 0;
+    /* fmt=4 carries [O, ceil(I/gs)] scales and quant_matmul reads them per row:
+     * the plain upload would also truncate the buffer to O floats. #298 fixed the
+     * dense-resident path's callers; this closes the entry itself so no future
+     * caller can reach the kernel with grouped scales. Grouped tensors take the
+     * expert-group path (#451) or stay on the CPU. */
+    if (fmt == 4) return 0;
     if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
@@ -657,6 +663,8 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
                                       const float *x, int S) {
     if (fault_injected()) return 0;
+    /* same reason as coli_cuda_matmul: this path's kernels are per-row only. */
+    if (gate && (gate->fmt == 4 || (up && up->fmt == 4) || (down && down->fmt == 4))) return 0;
     if (!gate || !up || !down || !x || !y || S < 1 ||
         gate->device != up->device || gate->device != down->device ||
         gate->I != up->I || gate->O != up->O ||
