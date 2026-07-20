@@ -187,6 +187,13 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
+**On Windows?** You don't need to build. Download the
+`colibri-<version>-windows-x86_64.zip` from
+[Releases](https://github.com/JustVugg/colibri/releases), unzip it, rename
+`colibri-*-windows-x86_64.exe` → `glm.exe` (so the `coli` launcher finds the
+engine), install [Python 3](https://www.python.org/downloads/), then run
+`coli chat`. Full walkthrough in the [Quick Start guide](docs/quickstart.md#windows).
+
 Prefer a `coli` command on your PATH? From a checkout, `pip install -e .`
 registers it (the engine itself still lives in `c/` — this is an editable
 install from the clone, not a standalone wheel).
