@@ -351,6 +351,12 @@ static int g_idot=1;
 static int g_i4s=1;
 #elif defined(__VSX__)
 static int g_i4s=1;
+#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
+static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
+                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
+                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
+                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
+                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
 #else
 static int g_i4s=2;
 #endif
