@@ -311,6 +311,12 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
+# Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
+# corruption in seconds (no model). OMP-parallel CPU reference.
+gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h
+	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
+	./gemm_largebatch_test
+
 cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
