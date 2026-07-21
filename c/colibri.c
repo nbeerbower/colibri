@@ -739,10 +739,10 @@ static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
 static int g_pilot_evict_guard=1;/* PILOT_EVICT_GUARD=0 -> old behavior (a speculation evicts the plain LRU).
-                          * Default ON: a speculative pilot load may evict a RESIDENT expert only if the
-                          * predicted expert is historically HOTTER than the victim (same LFRU hysteresis as
-                          * tier_pick_lfru); otherwise it drops the speculation rather than thrash a warm
-                          * demand-loaded expert. Cache placement only -> output byte-identical. (#441) */
+                          * Default ON: protect a RESIDENT demand-loaded expert from a speculation only when
+                          * it is genuinely WARM (>=2 accesses) AND clearly hotter than the predicted expert
+                          * by tier_pick_lfru's 25%+4-freq hysteresis; otherwise the speculation may evict the
+                          * plain-LRU victim as before. Cache placement only -> output byte-identical. (#441, #490) */
 /* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
  *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
  *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
@@ -3552,15 +3552,21 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
     if(nn<m->ecap){ slot=nn; isnew=1; }
     else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
-        /* LFRU eviction guard (#441): a speculation must not drop a WARM demand-loaded expert.
-         * Evict only if the predicted expert's history is hotter than the victim by tier_pick_lfru's
-         * hysteresis (25% + 4 freq); else drop the speculation. Cache placement only -> output unchanged. */
+        /* LFRU eviction guard (#441, fix #490): a speculation must not drop a WARM
+         * demand-loaded expert. We PROTECT the victim only when it is genuinely warm
+         * (>=2 demand accesses) AND clearly hotter than the speculation by tier_pick_lfru's
+         * 25%+4-freq hysteresis. The original #441 formula tested the speculation's score
+         * against victim+margin, which — because a speculation is by definition historically
+         * colder than a just-used demand expert — dropped ~all speculations once the cache
+         * was full, collapsing the LRU hit share (#490). Cache placement only -> output
+         * byte-identical (a dropped speculation is demand-loaded later, same value). */
         if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
-            int vid=Sl[lru].eid;
-            uint64_t vs=tier_lfru_score(m->eheat[layer][vid],m->elast[layer][vid],m->eaccess_clock);
-            uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-            if(cs<=vs+(vs>>2)+(4u<<8)){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                        pthread_mutex_unlock(&g_pilot_mx); return; } } }
+            int vid=Sl[lru].eid; uint32_t vh=m->eheat[layer][vid];
+            if(vh>=2){
+                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                            pthread_mutex_unlock(&g_pilot_mx); return; } } } }
     ESlot *dst=&Sl[slot];
     dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
     g_pilot_inflight[layer]++;
@@ -3611,13 +3617,18 @@ static void pilot_uring_batch(Model *m){
                 if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
                 if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
             }
-            /* LFRU eviction guard (#441): don't drop a warm resident for a speculation (see pilot_realload) */
+            /* LFRU eviction guard (#441, fix #490): protect a WARM resident from a speculation.
+             * Same corrected test as pilot_realload: victim must be genuinely warm (>=2 accesses)
+             * AND clearly hotter (25%+4-freq hysteresis). See pilot_realload for the rationale and
+             * the #490 regression the original formula caused. */
             if(slot>=0 && Sl[slot].eid>=0 && g_pilot_evict_guard && m->eheat && m->elast){
-                int vid=Sl[slot].eid;
-                uint64_t vs=tier_lfru_score(m->eheat[layer][vid],m->elast[layer][vid],m->eaccess_clock);
-                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-                if(cs<=vs+(vs>>2)+(4u<<8)){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                            pthread_mutex_unlock(&g_pilot_mx); continue; }
+                int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
+                if(vh>=2){
+                    uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
+                    uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                    if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                                pthread_mutex_unlock(&g_pilot_mx); continue; }
+                }
             }
         }
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
