@@ -663,8 +663,9 @@ def main():
             s0, s1 = segs[t]
             while done[t] < s1 - s0 and not stopfail:
                 pos = s0 + done[t]
-                req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
-                                                           "Range": f"bytes={pos}-{s1-1}"})
+                _hdrs = {"User-Agent": "colibri-convert", "Range": f"bytes={pos}-{s1-1}"}
+                if os.environ.get("HF_TOKEN"): _hdrs["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+                req = urllib.request.Request(url, headers=_hdrs)
                 try:
                     with urllib.request.urlopen(req, timeout=8) as r:
                         if r.status != 206:               # Range ignorato: multi-stream impossibile
@@ -727,6 +728,7 @@ def main():
             have0 = have
             req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
             if have: req.add_header("Range", f"bytes={have}-")
+            if os.environ.get("HF_TOKEN"): req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
             try:
                 with urllib.request.urlopen(req, timeout=8) as r:
                     if have and r.status == 200:          # server ha ignorato il Range: riparti pulito

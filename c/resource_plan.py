@@ -157,9 +157,22 @@ def discover_gpus():
         if len(fields) != 4:
             continue
         try:
-            index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
+            index = int(fields[0])
         except ValueError:
             continue
+        # Unified-memory chips (e.g. NVIDIA GB10 Grace Blackwell) have no
+        # discrete VRAM pool, so nvidia-smi reports memory.total/memory.free
+        # as "[N/A]" rather than a number. Fall back to system RAM figures
+        # in that case instead of silently dropping the GPU from discovery.
+        try:
+            total, free = int(fields[2]), int(fields[3])
+        except ValueError:
+            try:
+                meminfo = Path("/proc/meminfo").read_text()
+                total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
+                free = memory_available() // (1024 * 1024)
+            except (OSError, AttributeError):
+                total = free = 0
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
                         "free_bytes": free * 1024 * 1024})
