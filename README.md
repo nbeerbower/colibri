@@ -3,6 +3,12 @@
 </p>
 
 <p align="center">
+  <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
+  <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
+</p>
+
+<p align="center">
+  <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -44,6 +50,16 @@ brightness is routing heat, and every expert routed in a turn flashes white. Hov
 as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
 (poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
 
+## The vision
+
+Frontier models should not be sealed inside datacenters. colibrì exists so that
+**anyone curious enough can open one up**: run a 744B-parameter mind on hardware
+you already own, watch every expert fire in real time, and change the code that
+does it. Not renting intelligence behind an API — *holding* it: probing it,
+measuring it, improving it. Every optimisation in this project started with
+someone measuring something on their own machine; the engine is deliberately
+small enough that the next one can come from you.
+
 ## The idea
 
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
@@ -60,6 +76,18 @@ So the model doesn't need to *fit* in fast memory — it needs to be **placed**:
 - the **19,456 routed experts** (75 MoE layers × 256 + the MTP head, ~19 MB each
   at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a
   per-layer LRU cache, a learned pinned hot-store, and an optional VRAM tier.
+
+Think of the core algorithm as **a JIT, but for weights**. A compiler JIT never
+compiles the whole program — it watches what actually runs and compiles the hot
+paths, just in time. colibrì makes the same bet about a 744B parameter space:
+parameters are not resident state to be held, they are **data to be staged**
+across a heterogeneous storage hierarchy (VRAM / RAM / NVMe), exactly when the
+router proves they are needed. Measured routing heat decides which experts earn
+which tier, the router runs a layer ahead so prefetch hides the staging latency,
+and — like a JIT — the engine learns your workload: the more you run, the hotter
+the right experts get. It works because routing has measurable structure (see
+the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
+structure is cacheable.
 
 The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
 at runtime, no GPU required.
@@ -82,6 +110,22 @@ precision are the same whether an expert answered from VRAM or from disk.
   <img src="docs/media/tiers.png" width="880" alt="VRAM / RAM / NVMe three-tier expert residency">
 </p>
 
+### Dual-SSD: two copies of the model, twice the read bandwidth
+
+Decode is disk-bound on most machines, and expert reads are read-only — so if you have a **second SSD**, put a full copy of the model on it and let the engine stream from both drives at once:
+
+```bash
+COLI_MODEL=/fast/glm52_i4 COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat
+COLI_DISK_WEIGHTS=9,3 ...   # optional: primary,mirror bandwidth ratio (else measured at startup)
+```
+
+Each expert is routed to one drive by a deterministic hash, weighted by the two drives' measured (or declared) bandwidth, so readahead/PILOT prefetch and the demand read always hit the same drive and nothing is cached twice. The aggregate bandwidth is the sum of both drives — a 9 GB/s + 3 GB/s pair reads experts ~33% faster than the fast drive alone, and the OMP-parallel pin/warmup load streams from both. Details worth knowing:
+
+- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files silently stay on the primary, so a **partial mirror is fine** — a smaller second SSD holding only some shards still helps;
+- the mirror is **never written**: `.coli_usage`, `.coli_kv` and all sidecars stay on the primary;
+- a read error on the mirror falls back to the primary (one warning, no crash), so unplugging the second drive mid-run degrades instead of killing the server;
+- routing never changes tokens — both copies are byte-identical, and the per-run `MIRROR:` stats line shows GB served per drive.
+
 The same engine spans the whole range: on a 25 GB laptop everything streams from
 disk (slow but correct); on a large host the entire expert set becomes resident
 (`CUDA_EXPERT_GB=auto PIN_GB=all`) and disk drops out of the decode path
@@ -103,6 +147,13 @@ On GPUs, the resident pipeline (`COLI_CUDA_PIPE=2`) keeps the residual stream
 on-device across layers so the CPU expert loop runs uninterrupted; on Apple
 Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
 math on the unified-memory GPU.
+
+> **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
+> often a large win on drives with DRAM cache and bandwidth headroom (+34%
+> decode measured with `PIPE=1` on a Blackwell/Windows box; 4.25→9.69 GB/s in
+> iobench on a GB10) — but it is drive-dependent: QLC/DRAM-less or virtualised
+> disks can be neutral to negative. Try it first; keep what your hardware
+> rewards.
 
 ### Faithful model, compressed state
 
@@ -187,6 +238,13 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
+**On Windows?** You don't need to build. Download the
+`colibri-<version>-windows-x86_64.zip` from
+[Releases](https://github.com/JustVugg/colibri/releases), unzip it, rename
+`colibri-*-windows-x86_64.exe` → `glm.exe` (so the `coli` launcher finds the
+engine), install [Python 3](https://www.python.org/downloads/), then run
+`coli chat`. Full walkthrough in the [Quick Start guide](docs/quickstart.md#windows).
+
 Prefer a `coli` command on your PATH? From a checkout, `pip install -e .`
 registers it (the engine itself still lives in `c/` — this is an editable
 install from the clone, not a standalone wheel).
@@ -203,6 +261,18 @@ install from the clone, not a standalone wheel).
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+
+## What's next
+
+- **Algorithmic research is active.** The current hierarchy is LRU + a learned
+  pin set; the next step is under way — smarter placement and scheduling,
+  overlap of CPU and GPU expert execution, and routing-aware speculation.
+  Everything lands the way this project always works: measured, reviewed, and
+  merged in the open.
+- **More open models.** The tiering algorithm is model-agnostic: any MoE with
+  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
+  support for more open-weight families — **Kimi K2** (Moonshot AI),
+  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
 
 ## Supporting the project
 
@@ -243,6 +313,14 @@ delegate to the engine Makefile.
 The hummingbird weighs a few grams, hovers in place, and visits a thousand
 flowers a day. This engine keeps a 744-billion-parameter giant alive on
 hummingbird rations: 25 GB of RAM, twelve CPU cores, and a lot of disk patience.
+
+## Acknowledgements
+
+colibrì is an engine; the minds it runs are a gift. Thank you to the teams
+releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
+(Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
+contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
+This project is proof of what open weights make possible.
 
 ## License
 

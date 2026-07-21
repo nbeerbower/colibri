@@ -42,11 +42,31 @@ engine needs.
 You have two options.
 
 **Option A — download a prebuilt binary (no compiler needed).**
-Grab the latest `colibri-<version>-windows-x86_64.zip` from the
-[Releases page](https://github.com/JustVugg/colibri/releases), unzip it, and
-skip to [step 3](#3-get-the-model). Python 3 (from
-[python.org](https://www.python.org/downloads/)) is still needed if you want to
-convert a model yourself.
+Grab `colibri-<version>-windows-x86_64.zip` from the
+[Releases page](https://github.com/JustVugg/colibri/releases) and unzip it.
+Inside you'll find:
+
+| File | What it is |
+|---|---|
+| `colibri-<version>-windows-x86_64.exe` | **the engine** — the C program that actually runs the model |
+| `coli` | the command-line launcher (`chat`, `serve`, `convert`, `doctor`, …) |
+| `openai_server.py`, `resource_plan.py`, `doctor.py` | Python support for the API server and placement planner |
+
+Two setup steps:
+
+1. **Rename the engine to `glm.exe`** so the launcher can find it (it looks for a
+   binary named `glm`):
+   ```powershell
+   Rename-Item colibri-*-windows-x86_64.exe glm.exe
+   ```
+2. **Install Python 3** from [python.org](https://www.python.org/downloads/) — the
+   `coli` launcher and the API gateway are Python scripts (the engine itself is
+   pure C and needs nothing).
+
+Then continue to [step 3](#3-get-the-model). Prefer to skip the launcher? You can
+run the engine directly — `.\glm.exe` reads the model path from the `SNAP`
+environment variable (see [docs/windows.md](windows.md)) — but `coli chat` is the
+easy path.
 
 **Option B — build from source with MSYS2.**
 Install [MSYS2](https://www.msys2.org/), open the **UCRT64** shell, and run:
