@@ -847,13 +847,21 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
     // its prior contents -- fresh-zero standalone (nerr=1.0), stale scratch in-engine (the
     // nondeterministic long-context corruption). Chunk over rows so each dispatch stays <=2^25
     // elements (grid <=2^23 tg, ~4x under the observed-clean bound). Chunks write disjoint g_gy
-    // ranges; g_gx/g_gy offsets are 16B-aligned (I,O multiples of 4).
+    // ranges. Offset alignment is STRUCTURAL, not shape-dependent (holds for any I,O -- a tiny
+    // oracle checkpoint or a future container with odd dims, not just GLM's shapes): g_gy is only
+    // ever written scalar (y[row]), so r0*O*4 needs just 4B; and the 16B float4 loads on g_gx
+    // execute only inside loops gated by I8=(I&7)?0:(I/8), i.e. only when I%8==0, where r0*I*4 is
+    // a multiple of 32. With I%8!=0, I8=0, x4 is never dereferenced and x is read scalar via xr[i].
     // COLI_GEMM_CHUNK=0 disables chunking (one full dispatch = the buggy pre-fix behavior) so the
     // fix can be A/B'd on a single binary. Default on.
     static int chunk_on=-1;
     if(chunk_on<0){ const char*e=getenv("COLI_GEMM_CHUNK"); chunk_on=(e&&e[0]=='0'&&!e[1])?0:1; }
     const int64_t NT_MAX = chunk_on ? ((int64_t)1<<25) : ((int64_t)1<<62);
-    int CH=(int)(NT_MAX/O); if(CH<1) CH=1; if((int64_t)CH>S) CH=S;
+    // Clamp in 64-bit BEFORE narrowing: with chunking off NT_MAX/O is ~1.6e14 for kv_b (O=28672),
+    // far past INT_MAX, so casting first is implementation-defined. Were it to truncate negative
+    // on some toolchain, CH=1 would make the disable path dispatch one row at a time and silently
+    // STOP reproducing the bug it exists to demonstrate. After the clamp CH <= S <= INT_MAX.
+    int64_t ch64=NT_MAX/O; if(ch64<1) ch64=1; if(ch64>S) ch64=S; int CH=(int)ch64;
     for(int r0=0;r0<S;r0+=CH){
       int ch=(S-r0<CH)?(S-r0):CH; int NT=ch*O;
       [e setBuffer:g_gx offset:(size_t)r0*I*4 atIndex:2];
