@@ -3,7 +3,10 @@
 //
 // Isolation established (see INVESTIGATION_LOG_metal_moe_race.md): corruption <=> dense
 // GEMM on GPU (`coli_metal_gemm`), independent of MoE. The engine's existing kernel tests
-// only exercise S<=64, which is why the S>=~2400 fault was never caught.
+// only exercise S<=64, which is why this fault was never caught. The trigger is the DISPATCH
+// GRID (NT=S*O), not S alone: only the largest-O shape here (kv_b, O=28672) crosses the device
+// limit, and only at S=7478 (~5.4e7 tg) -- it is still clean at S=4376 (~3.1e7 tg), and the
+// smaller-O shapes (gate/up, down) stay clean at every S in the sweep.
 //
 // This sweeps S across the clean/corrupt bracket for a few real GLM matmul shapes,
 // compares GPU vs CPU reference, prints the first diverging (row,col), AND runs the GPU
@@ -95,7 +98,7 @@ int main(void){
     { 6144, 2048, "down    (O6144,I2048)" },
     { 28672, 512, "kv_b    (O28672,I512)" },
   };
-  int Ss[] = { 512, 2153, 4376, 7478 };   // clean control / clean bracket / corrupt bracket / worst
+  int Ss[] = { 512, 2153, 4376, 7478 };   // control / clean / clean, just under the kv_b cliff / CORRUPT for kv_b
   for(auto &sh : shapes){
     for(int S : Ss) fail |= run_gemm(I4, sh.O, sh.I, S, sh.n);
     printf("\n");
