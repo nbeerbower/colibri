@@ -96,7 +96,9 @@ jobs:
           case "$out" in
             *"engine is not built"*) echo "FAIL: coli cannot find the packaged engine"; exit 1 ;;
           esac
-          echo "$out" | grep -q "colibri" || { echo "FAIL: coli did not run"; exit 1; }
+          # "colibr", not "colibri": the banner spells the name "colibrì" (accented ì),
+          # so the ASCII-only grep matched nothing and failed the v1.1.0 tag build.
+          echo "$out" | grep -q "colibr" || { echo "FAIL: coli did not run"; exit 1; }
           echo "OK: coli locates the engine in the published archive"
 
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
