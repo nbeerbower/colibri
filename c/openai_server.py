@@ -437,6 +437,152 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- Anthropic Messages API (#343) --------------------------------------------------------
+# A translation layer, NOT a second engine path: /v1/messages rewrites an Anthropic-shaped
+# request into the exact OpenAI-shaped body the existing path already validates, so prompt
+# rendering, scheduling, generation and tool parsing stay single-sourced. Only the request
+# translation and the response/SSE shapes are new. Claude Code is the reference client.
+
+def _anthropic_block_text(blocks, param):
+    """Text out of an Anthropic content array (tool_result content is the same shape)."""
+    if isinstance(blocks, str):
+        return blocks
+    if not isinstance(blocks, list):
+        raise APIError(400, "Content must be a string or an array of blocks.", param)
+    parts = []
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            raise APIError(400, "Colibri currently supports text blocks only here.",
+                           f"{param}.{index}", "unsupported_content_type")
+        if not isinstance(block.get("text"), str):
+            raise APIError(400, "Text blocks require a string `text` field.", f"{param}.{index}.text")
+        parts.append(block["text"])
+    return "".join(parts)
+
+
+def anthropic_to_openai(body):
+    """Anthropic request -> (messages, tools, tool_choice) in OpenAI shape."""
+    messages = []
+    system = body.get("system")
+    if isinstance(system, str):
+        if system:
+            messages.append({"role": "system", "content": system})
+    elif isinstance(system, list):
+        text = _anthropic_block_text(system, "system")
+        if text:
+            messages.append({"role": "system", "content": text})
+    elif system is not None:
+        raise APIError(400, "`system` must be a string or an array of text blocks.", "system")
+
+    raw = body.get("messages")
+    if not isinstance(raw, list) or not raw:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    for index, message in enumerate(raw):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            raise APIError(400, f"Unsupported message role: {role!r}. Anthropic messages are "
+                           "`user` or `assistant`; a system prompt goes in the top-level `system`.",
+                           f"messages.{index}.role", "unsupported_role")
+        content = message.get("content")
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            raise APIError(400, "Message content must be a string or an array of blocks.",
+                           f"messages.{index}.content")
+        texts, calls, results = [], [], []
+        for j, block in enumerate(content):
+            where = f"messages.{index}.content.{j}"
+            if not isinstance(block, dict):
+                raise APIError(400, "Each content block must be an object.", where)
+            kind = block.get("type")
+            if kind == "text":
+                if not isinstance(block.get("text"), str):
+                    raise APIError(400, "Text blocks require a string `text` field.", f"{where}.text")
+                texts.append(block["text"])
+            elif kind == "tool_use":
+                name = block.get("name")
+                if not isinstance(name, str) or not name:
+                    raise APIError(400, "`tool_use` blocks require a string `name`.", f"{where}.name")
+                arguments = block.get("input")
+                if arguments is None:
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    raise APIError(400, "`tool_use.input` must be an object.", f"{where}.input")
+                calls.append({"id": block.get("id") or ("toolu_" + uuid.uuid4().hex[:24]),
+                              "type": "function",
+                              "function": {"name": name,
+                                           "arguments": json.dumps(arguments, ensure_ascii=False)}})
+            elif kind == "tool_result":
+                results.append({"role": "tool",
+                                "tool_call_id": block.get("tool_use_id") or "",
+                                "content": _anthropic_block_text(block.get("content", ""),
+                                                                 f"{where}.content")})
+            else:
+                raise APIError(400, "Colibri supports `text`, `tool_use` and `tool_result` "
+                               "content blocks only.", f"{where}.type", "unsupported_content_type")
+        # tool results precede the user's own text: they answer the previous assistant turn
+        messages.extend(results)
+        text = "".join(texts)
+        if role == "assistant":
+            if text or calls:
+                entry = {"role": "assistant", "content": text or None}
+                if calls:
+                    entry["tool_calls"] = calls
+                messages.append(entry)
+        elif text or not results:
+            messages.append({"role": "user", "content": text})
+    return messages
+
+
+def anthropic_tools(body):
+    """Anthropic tools/tool_choice -> OpenAI shape (validated downstream by generation_options)."""
+    raw = body.get("tools")
+    if raw is None:
+        tools = None
+    elif not isinstance(raw, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    else:
+        tools = []
+        for index, tool in enumerate(raw):
+            if not isinstance(tool, dict):
+                raise APIError(400, "Each tool must be an object.", f"tools.{index}")
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                raise APIError(400, "Each tool requires a string `name`.", f"tools.{index}.name")
+            schema = tool.get("input_schema")
+            if schema is not None and not isinstance(schema, dict):
+                raise APIError(400, "`input_schema` must be an object.", f"tools.{index}.input_schema")
+            function = {"name": name, "parameters": schema or {"type": "object", "properties": {}}}
+            if isinstance(tool.get("description"), str):
+                function["description"] = tool["description"]
+            tools.append({"type": "function", "function": function})
+        tools = tools or None
+
+    choice = body.get("tool_choice")
+    if choice is None:
+        return tools, None
+    if not isinstance(choice, dict):
+        raise APIError(400, "`tool_choice` must be an object.", "tool_choice")
+    kind = choice.get("type")
+    if kind == "auto":
+        return tools, "auto"
+    if kind == "any":
+        return tools, "required"
+    if kind == "none":
+        return tools, "none"
+    if kind == "tool":
+        name = choice.get("name")
+        if not isinstance(name, str) or not name:
+            raise APIError(400, "`tool_choice.name` is required when type is `tool`.",
+                           "tool_choice.name")
+        return tools, {"type": "function", "function": {"name": name}}
+    raise APIError(400, "`tool_choice.type` must be auto, any, none, or tool.", "tool_choice.type",
+                   "unsupported_value")
+
+
 # Generic whitespace-tolerant JSON grammar for response_format {"type": "json_object"}.
 # Draft-source semantics: positions with one legal byte draft; jws points just keep
 # the walker alive through the model's own spacing (see docs/grammar-draft.md).
@@ -856,7 +1002,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
         self.send_header("Access-Control-Expose-Headers",
                          "x-request-id, x-colibri-queue-wait-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
@@ -866,12 +1012,16 @@ class APIHandler(BaseHTTPRequestHandler):
     LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
 
     def _is_authed(self):
-        """True if no key is configured, or a correct Bearer key was presented."""
+        """True if no key is configured, or a correct key was presented. Anthropic clients
+        (Claude Code, the Anthropic SDKs) authenticate with `x-api-key`, not `Bearer` — both
+        are accepted, and both are compared in constant time."""
         if not self.server.api_key:
             return True
         import hmac
-        provided = self.headers.get("Authorization", "")
-        return hmac.compare_digest(provided, f"Bearer {self.server.api_key}")
+        if hmac.compare_digest(self.headers.get("Authorization", ""),
+                               f"Bearer {self.server.api_key}"):
+            return True
+        return hmac.compare_digest(self.headers.get("x-api-key", ""), self.server.api_key)
 
     def require_auth(self):
         if not self._is_authed():
@@ -1023,10 +1173,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
+            elif path == "/v1/messages":
+                self.anthropic_messages(body, request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, error_object(error), request_id, error.headers)
+            self.send_json(error.status, self.error_body(error), request_id, error.headers)
         except ClientCancelled:
             pass
         except (BrokenPipeError, ConnectionResetError):
@@ -1036,9 +1188,15 @@ class APIHandler(BaseHTTPRequestHandler):
             api_error = APIError(500, "The colibri engine failed to process the request.",
                                  None, "engine_error", "server_error")
             try:
-                self.send_json(500, error_object(api_error), request_id)
+                self.send_json(500, self.error_body(api_error), request_id)
             except OSError:
                 pass
+
+    def error_body(self, error):
+        """Anthropic clients parse a different error envelope; the OpenAI one is unchanged."""
+        if urlsplit(self.path).path != "/v1/messages":
+            return error_object(error)
+        return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
@@ -1260,6 +1418,189 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
                              tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
+
+    # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
+    ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+
+    def anthropic_messages(self, body, request_id):
+        for unsupported, why in (("stop_sequences", "custom stop sequences"),
+                                 ("top_k", "top-k sampling")):
+            if body.get(unsupported) not in (None, [], ""):
+                raise APIError(400, f"Colibri does not support `{unsupported}` ({why}) yet.",
+                               unsupported, "unsupported_value")
+        messages = anthropic_to_openai(body)
+        tools, tool_choice = anthropic_tools(body)
+        thinking = body.get("thinking")
+        if thinking is not None and not isinstance(thinking, dict):
+            raise APIError(400, "`thinking` must be an object.", "thinking")
+        enable_thinking = bool(thinking and thinking.get("type") == "enabled")
+        if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
+            enable_thinking = True
+        if body.get("max_tokens") is None:
+            raise APIError(400, "`max_tokens` is required.", "max_tokens")
+        # Reuse the OpenAI path's own validation by handing it an equivalent body.
+        translated = {"messages": messages, "max_tokens": body.get("max_tokens"),
+                      "temperature": body.get("temperature"), "top_p": body.get("top_p"),
+                      "stream": body.get("stream", False), "cache_slot": body.get("cache_slot")}
+        if tools:
+            translated["tools"] = tools
+        if tool_choice is not None:
+            translated["tool_choice"] = tool_choice
+        if tool_choice == "none":
+            tools = None
+        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
+                             tools, tool_choice)
+        self.anthropic_generation(translated, prompt, request_id, tools)
+
+    def anthropic_generation(self, body, prompt, request_id, tools):
+        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        cache_slot = body.get("cache_slot")
+        if (cache_slot is not None and
+                (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
+                 not 0 <= cache_slot < self.server.kv_slots)):
+            raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
+                           "cache_slot")
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise APIError(400, "`stream` must be a boolean.", "stream")
+        message_id = "msg_" + uuid.uuid4().hex[:24]
+
+        def blocks_and_stop(text, stats):
+            """Split a finished reply into Anthropic content blocks + stop_reason."""
+            calls = []
+            if tools:
+                text, calls = parse_tool_calls(text, tools)
+            content = []
+            if text:
+                content.append({"type": "text", "text": text})
+            for call in calls:
+                function = call["function"]
+                try:
+                    arguments = json.loads(function["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+                content.append({"type": "tool_use", "id": call["id"],
+                                "name": function["name"], "input": arguments})
+            reason = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+            return content, self.ANTHROPIC_STOP[reason]
+
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+            queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if not stream:
+                output = []
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, output.append, cache_slot,
+                    self.client_disconnected, grammar=grammar)
+                content, stop_reason = blocks_and_stop("".join(output), stats)
+                self.send_json(200, {
+                    "id": message_id, "type": "message", "role": "assistant",
+                    "model": self.server.model_id, "content": content,
+                    "stop_reason": stop_reason, "stop_sequence": None,
+                    "usage": {"input_tokens": stats["prompt_tokens"],
+                              "output_tokens": stats["completion_tokens"]}},
+                    request_id, queue_headers)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("x-request-id", request_id)
+            for name, value in queue_headers.items():
+                self.send_header(name, value)
+            self.send_cors_headers()
+            self.end_headers()
+            connected = [True]
+            write_lock = threading.Lock()
+            last_write = [time.time()]
+            ka_stop = threading.Event()
+
+            def send_event(name, payload):
+                if not connected[0]:
+                    return
+                data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                with write_lock:
+                    try:
+                        self.wfile.write(f"event: {name}\ndata: {data}\n\n".encode())
+                        self.wfile.flush()
+                        last_write[0] = time.time()
+                    except OSError:
+                        connected[0] = False
+
+            # Anthropic has a first-class keepalive event, so the cold prefill (minutes) does
+            # not need the OpenAI path's reasoning-delta trick: `ping` is in the protocol.
+            def keepalive():
+                while not ka_stop.wait(1.0):
+                    if not connected[0]:
+                        return
+                    if time.time() - last_write[0] >= 10.0:
+                        send_event("ping", {"type": "ping"})
+
+            send_event("message_start", {"type": "message_start", "message": {
+                "id": message_id, "type": "message", "role": "assistant",
+                "model": self.server.model_id, "content": [], "stop_reason": None,
+                "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+            send_event("content_block_start", {"type": "content_block_start", "index": 0,
+                                               "content_block": {"type": "text", "text": ""}})
+            ka_thread = threading.Thread(target=keepalive, daemon=True)
+            ka_thread.start()
+
+            raw = []
+            state = {"buf": "", "in_tool": False}
+            hold = len(BOX_START) - 1
+
+            def on_text(chunk):
+                raw.append(chunk)
+                if not tools:
+                    send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": chunk}})
+                    return
+                if state["in_tool"]:
+                    return                       # tool markers never reach the client as text
+                state["buf"] += chunk
+                cut = state["buf"].find(BOX_START)
+                if cut >= 0:
+                    if cut:
+                        send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta", "text": state["buf"][:cut]}})
+                    state["buf"] = ""
+                    state["in_tool"] = True
+                    return
+                flush = max(0, len(state["buf"]) - hold)
+                if flush:
+                    send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": state["buf"][:flush]}})
+                    state["buf"] = state["buf"][flush:]
+
+            stats = self.server.engine.generate(
+                prompt, maximum, temperature, top_p, on_text, cache_slot,
+                lambda: not connected[0], grammar=grammar)
+            if tools and not state["in_tool"] and state["buf"]:
+                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": state["buf"]}})
+            ka_stop.set()
+            ka_thread.join(timeout=2)
+            send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+            content, stop_reason = blocks_and_stop("".join(raw), stats)
+            index = 1
+            for block in content:
+                if block["type"] != "tool_use":
+                    continue                     # text already streamed as block 0
+                send_event("content_block_start", {"type": "content_block_start", "index": index,
+                    "content_block": {"type": "tool_use", "id": block["id"],
+                                      "name": block["name"], "input": {}}})
+                send_event("content_block_delta", {"type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": json.dumps(block["input"], ensure_ascii=False)}})
+                send_event("content_block_stop", {"type": "content_block_stop", "index": index})
+                index += 1
+            send_event("message_delta", {"type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": stats["completion_tokens"]}})
+            send_event("message_stop", {"type": "message_stop"})
+            self.close_connection = True
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
