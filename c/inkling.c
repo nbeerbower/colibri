@@ -29,6 +29,7 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#include <sys/select.h>                              /* serve-loop stdin poll (POSIX); inkling serves on Linux */
 #endif
 #include "st.h"
 #include "tok.h"
@@ -1132,6 +1133,239 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     free(ids);
 }
 
+/* ---------- serve mode: openai_server.py engine protocol ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
+ *         CANCEL <id>\n
+ * stdout: READY sentinel once loaded, then per request a stream of
+ *         DATA <id> <size>\n<bytes>\n frames and a final
+ *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
+ * Byte-identical to colibri.c's serve protocol so the shared openai_server.py
+ * gateway drives inkling unchanged (v1: one request at a time; the KV slot arg
+ * is accepted but every request re-prefills). */
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+static double rng_next(void) {
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+    return (double)(g_rng >> 11) / 9007199254740992.0;
+}
+
+/* temperature + top-p nucleus sampling; temp<=0 = greedy (the oracle path) */
+typedef struct { float p; int i; } PI;
+static int pi_desc(const void *a, const void *b) {
+    float d = ((const PI*)b)->p - ((const PI*)a)->p;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+static int sample_logits(const float *logit, int n, float temp, float top_p) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    if (temp <= 0.f) return best;
+    PI *c = malloc((size_t)n * sizeof(PI));
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+        c[i].p = expf((logit[i] - logit[best]) / temp);
+        c[i].i = i; sum += c[i].p;
+    }
+    qsort(c, n, sizeof(PI), pi_desc);
+    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
+    double acc = 0; int k = 0;
+    while (k < n && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0;
+    int pick = c[0].i;
+    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+    free(c);
+    return pick;
+}
+
+/* light repeat guard: recently emitted tokens get their logit divided by pen>1 */
+static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, float pen) {
+    if (pen <= 1.f) return;
+    for (int i = 0; i < nhist; i++) {
+        int t = hist[i];
+        if (t < 0 || t >= n) continue;
+        logit[t] = logit[t] > 0 ? logit[t] / pen : logit[t] * pen;
+    }
+}
+
+/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192) */
+static const char *prompt_reject(int np, int want) {
+    const char *cm = getenv("CTX_MAX");
+    int ctx_max = cm ? atoi(cm) : 8192;
+    if (np + want > ctx_max) return "context exceeds CTX_MAX";
+    return NULL;
+}
+
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define SRV_QMAX 16
+static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+
+static int stdin_readable(void) {
+    fd_set r; struct timeval tv = {0, 0};
+    FD_ZERO(&r); FD_SET(0, &r);
+    return select(1, &r, NULL, NULL, &tv) > 0;
+}
+
+/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static int serve_read_cmd(const char *cur_id) {
+    char ln[512];
+    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    char cmd[16], id[64];
+    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
+    if (!strcmp(cmd, "SUBMIT")) {
+        int slot, plen, max_tok; float temp, top_p;
+        if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 ||
+            plen < 0 || plen > (1<<22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        (void)slot;
+        char *pl = malloc((size_t)plen + 1);
+        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        int nl = fgetc(stdin); (void)nl;
+        pl[plen] = 0;
+        if (g_qn < SRV_QMAX) {
+            SReq *q = &g_q[g_qn++];
+            snprintf(q->id, sizeof(q->id), "%s", id);
+            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+            q->payload = pl; q->plen = plen;
+        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    }
+    return 0;
+}
+
+static void serve_one(Model *m, Tok *T, SReq *q) {
+    Cfg *c = &m->c;
+    int cap = q->plen + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    const char *bad = prompt_reject(np, q->max_tok);
+    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    state_reset(m);
+    kv_alloc(m, np + q->max_tok + 8);
+    double t0 = now_s();
+    uint64_t h0 = m->hits, m0 = m->miss;
+    /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
+    double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
+    float *logit = step(m, ids, np, 0, NULL);
+    int len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
+    /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
+    float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
+    int hist[128], nhist = 0;
+    for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
+        int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
+        free(logit); logit = NULL;
+        if (tk == c->eos) { limited = 0; break; }
+        if (nhist < 128) hist[nhist++] = tk;
+        else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
+        int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+        printf("DATA %s %d\n", q->id, nb);
+        fwrite(buf, 1, (size_t)nb, stdout);
+        fputc('\n', stdout); fflush(stdout);
+        gen++; len++;
+        while (stdin_readable()) {
+            int r = serve_read_cmd(q->id);
+            if (r < 0) { free(ids); return; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+        if (cancelled || s == q->max_tok - 1) break;
+        logit = step(m, &tk, 1, len - 1, NULL);
+    }
+    free(logit);
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits - h0 + m->miss - m0);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
+     * expert_wait -> shared-expert compute, lm_head folded into 0). */
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
+           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
+    fflush(stdout);
+    free(ids);
+}
+
+/* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
+ * Same stdout lines colibri.c emits for the web dashboard; the gateway parses
+ * them and the Brain/Profiling pages render live expert-tier state. */
+static void serve_hwinfo(Model *m) {
+    char cpu[256] = ""; int cores = 0; double rt = 0, ra = 0;
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) { char ln[256];
+        while (fgets(ln, sizeof(ln), ci)) if (!strncmp(ln, "model name", 10)) {
+            char *p = strchr(ln, ':'); if (p) { p++; while (*p == ' ') p++;
+            int n = (int)strlen(p); if (n > 0 && p[n-1] == '\n') p[--n] = 0;
+            snprintf(cpu, sizeof(cpu), "%s", p); } break; }
+        fclose(ci); }
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) { char ln[256]; double v = 0;
+        while (fgets(ln, sizeof(ln), mi)) {
+            if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
+        } fclose(mi); }
+    int ngpu = 0; double vram = 0;
+    const char *gpu = "";
+#ifdef COLI_CUDA
+    if (g_cuda) { ngpu = 1; vram = ink_cuda_free_bytes()/1e9; gpu = "CUDA device"; }
+#endif
+    (void)m;
+    printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n", cores, rt, ra, ngpu, vram, cpu[0]?cpu:"unknown", gpu);
+    fflush(stdout);
+}
+
+static void serve_tiers_emap(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    int nsp = 0, filled = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) { nsp++; filled += m->cache[i].n; }
+    int64_t I = c->moe_inter, D = c->hidden;
+    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
+                  : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, nsp*E - filled, filled*(double)slotb/1e9);
+    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
+    char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->sparse[i]) continue;
+        LCache *lc = &m->cache[i];
+        for (int e = 0; e < E; e++) {
+            int tier = 0;
+            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e && lc->slots[z].filled) { tier = 1; break; }
+            uint32_t u = m->eusage[i] ? m->eusage[i][e] : 0;
+            int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
+            int b = (tier << 6) | heat;
+            hex[w++] = "0123456789abcdef"[b >> 4];
+            hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    printf("EMAP %d %d %s\n", nsp, E, hex);
+    fflush(stdout); free(hex);
+}
+
+static void serve_loop(Model *m, Tok *T) {
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
+    else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
+    /* the gateway reads a STAT line right after the READY sentinel (colibri
+     * reports its load stats there) — match the handshake */
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    serve_hwinfo(m);
+    serve_tiers_emap(m);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        SReq q = g_q[0];
+        memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
+        serve_one(m, T, &q);
+        serve_tiers_emap(m);
+        free(q.payload);
+    }
+}
+
 /* ---------- ref_inkling.json harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -1177,6 +1411,18 @@ int main(int argc, char **argv) {
     }
     if (cap < 0) cap = (prompt || pfile) ? 0 : 16;   /* generate mode defaults to RAM-sized auto cap */
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
+
+    /* SERVE=1: the openai_server.py gateway drives the engine over stdin/stdout
+     * (READY handshake, SUBMIT/CANCEL, DATA/DONE frames) — same protocol colibri. */
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        Model m; model_init(&m, snap, cap, bits);
+        pins_load(&m, snap);
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        serve_loop(&m, &T);
+        usage_save(&m, snap);
+        return 0;
+    }
 
     if (prompt || pfile) {
         Model m; model_init(&m, snap, cap, bits);
