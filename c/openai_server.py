@@ -357,6 +357,8 @@ def parse_tool_calls(reply, tools=None):
     text = _BOX_RE.sub("", reply)
     if tail is not None:                       # drop the recovered tail from the visible content
         text = text[:text.rindex(BOX_START)]
+    if ARCH == "inkling":
+        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
     text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
@@ -369,6 +371,150 @@ def parse_tool_calls(reply, tools=None):
                             (" -> " + ", ".join(salvaged)) if dm else ""))
         sys.stderr.flush()
     return text.strip(), calls
+
+
+ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
+
+INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
+
+
+class InklingStreamSplit:
+    """Strips Inkling's content markers from the visible stream and withholds
+    <|content_thinking|> sections from `content` (they are reasoning, not
+    answer). Buffers partial markers across chunk boundaries so a marker split
+    between two DATA frames never leaks."""
+
+    def __init__(self, on_content, on_reasoning=None):
+        self.on_content = on_content
+        self.on_reasoning = on_reasoning
+        self.mode = "content"
+        self.buf = ""
+
+    def feed(self, piece):
+        self.buf += piece
+        while True:
+            hits = [(i, m) for i, m in ((self.buf.find(INK_THINK), INK_THINK),
+                                        (self.buf.find(INK_TEXT), INK_TEXT)) if i >= 0]
+            if not hits:
+                hold = self._tail_hold()
+                out = self.buf[:len(self.buf) - hold] if hold else self.buf
+                self.buf = self.buf[len(self.buf) - hold:] if hold else ""
+                self._emit(out)
+                return
+            i, m = min(hits)
+            self._emit(self.buf[:i])
+            self.mode = "reasoning" if m == INK_THINK else "content"
+            self.buf = self.buf[i + len(m):]
+
+    def _tail_hold(self):
+        for k in range(min(len(self.buf), 24), 0, -1):
+            if INK_THINK.startswith(self.buf[-k:]) or INK_TEXT.startswith(self.buf[-k:]):
+                return k
+        return 0
+
+    def _emit(self, text):
+        if not text:
+            return
+        text = _INK_MARKER.sub("", text)
+        if not text:
+            return
+        if self.mode == "content":
+            self.on_content(text)
+        elif self.on_reasoning:
+            self.on_reasoning(text)
+
+    def close(self):
+        self._emit(self.buf)
+        self.buf = ""
+
+
+import re as _re
+_INK_MARKER = _re.compile(r"<\|(?:content_\w+|end_message|message_\w+|audio_end|unused_\d+)\|>")
+
+def strip_inkling_markers(text):
+    """Remove <|content_thinking|>…<|content_text|> sections, then any stray
+    control markers (end_message, role/content tokens) the model emits."""
+    while INK_THINK in text:
+        pre, _, rest = text.partition(INK_THINK)
+        _, _, after = rest.partition(INK_TEXT)
+        text = pre + after
+    return _INK_MARKER.sub("", text)
+
+
+def split_inkling(text):
+    """Split raw Inkling output into (content, reasoning). Thinking blocks
+    (<|content_thinking|>…<|content_text|>) become reasoning — including an
+    UNTERMINATED trailing block (budget ran out mid-thought), which partitions
+    to everything after the opener — so a think-only generation surfaces its
+    reasoning instead of collapsing to an empty answer."""
+    reasoning = []
+    while INK_THINK in text:
+        pre, _, rest = text.partition(INK_THINK)
+        think, _, after = rest.partition(INK_TEXT)
+        reasoning.append(think)
+        text = pre + after
+    return _INK_MARKER.sub("", text), _INK_MARKER.sub("", "".join(reasoning))
+
+
+def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                        tool_choice=None):
+    """Text-only subset of Inkling's chat_template.jinja: role tokens with
+    <|content_text|> parts and <|end_message|> terminators, an assistant
+    <|content_model_end_sampling|> after each prior model turn, the
+    thinking-effort hint appended after the messages (the template's fallback
+    branch), then <|message_model|> as the generation prompt."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Inkling engine yet.",
+                       "tools", "unsupported_parameter")
+    role_token = {"user": "<|message_user|>", "system": "<|message_system|>",
+                  "developer": "<|message_system|>", "assistant": "<|message_model|>",
+                  "tool": "<|message_tool|>"}
+    # Thinking effort — template default is 0.9, but at single-machine decode
+    # speeds unrequested reasoning burns the whole token budget before the answer
+    # starts, so we default it OFF unless the client asks.
+    effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7,
+                  "high": 0.9, "max": 0.99}
+    if reasoning_effort in effort_map:
+        eff = effort_map[reasoning_effort]
+    else:
+        eff = 0.9 if enable_thinking else 0.0
+    effort_str = ("<|message_system|><|content_text|>Thinking effort level: "
+                  f"{0 if eff == 0.0 else eff}<|end_message|>")
+
+    prompt = []
+    effort_emitted = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        rtok = role_token.get(role)
+        if rtok is None:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        # the template emits the effort hint inline, right before the first
+        # non-system message — not at the end. Position matters: it changes the
+        # exact token sequence the model was trained on.
+        if not effort_emitted and role not in ("system", "developer"):
+            prompt.append(effort_str)
+            effort_emitted = True
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
+        if role == "assistant":
+            prompt.append("<|content_model_end_sampling|>")
+    if not effort_emitted:                       # all-system edge case: fallback
+        prompt.append(effort_str)
+    prompt.append("<|message_model|>")           # add_generation_prompt
+    # Thinking off: prefill the content channel. Without this the model can still
+    # sample <|content_thinking|> as its first token (the effort hint is only a
+    # soft signal), open a reasoning block, and burn the whole token budget before
+    # reaching <|content_text|> — which the splitter then strips to an empty
+    # answer. Ending the prompt at <|message_model|><|content_text|> forces content
+    # mode; it is exactly the sequence every non-thinking turn is trained on.
+    if eff == 0.0:
+        prompt.append("<|content_text|>")
+    return "".join(prompt)
 
 
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1222,6 +1368,11 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
         maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        if grammar is not None and ARCH == "inkling":
+            # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
+            # grammar payload extension would desync its stdin framing.
+            raise APIError(400, "`response_format` grammars are not supported by the Inkling "
+                                "engine yet.", "response_format", "unsupported_parameter")
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
@@ -1252,17 +1403,25 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, output.append, cache_slot,
                     self.client_disconnected, grammar=grammar)
                 text = "".join(output)
+                reasoning = ""
+                if ARCH == "inkling":
+                    text, reasoning = split_inkling(text)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = parse_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
                     choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
                 else:
-                    choice = ({"index": 0, "message": {"role": "assistant", "content": text,
-                               "refusal": None}, "logprobs": None, "finish_reason": length_finish} if chat else
+                    _msg = {"role": "assistant", "content": text, "refusal": None}
+                    if reasoning:
+                        _msg["reasoning_content"] = reasoning
+                    choice = ({"index": 0, "message": _msg,
+                               "logprobs": None, "finish_reason": length_finish} if chat else
                               {"index": 0, "text": text, "logprobs": None, "finish_reason": length_finish})
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
@@ -1328,6 +1487,13 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
+            def emit_reasoning(text):     # thinking → reasoning_content deltas (chat only)
+                event([{"index": 0, "delta": {"reasoning_content": text},
+                        "logprobs": None, "finish_reason": None}])
+
+            splitter = (InklingStreamSplit(emit, emit_reasoning if chat else None)
+                        if ARCH == "inkling" else None)
+
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
             if chat and tools:
@@ -1371,10 +1537,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 def emit_plain(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
-                    emit(chunk)
+                    (splitter.feed if splitter else emit)(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot,
                     lambda: not connected, grammar=grammar)
+                if splitter:
+                    splitter.close()
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
@@ -1427,8 +1595,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                             tool_choice)
+        renderer = render_chat_inkling if ARCH == "inkling" else render_chat
+        prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                          tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
@@ -1673,9 +1842,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
+                        help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
@@ -1686,6 +1857,16 @@ def main():
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
     args = parser.parse_args()
+    global ARCH
+    ARCH = args.arch
+    if ARCH == "auto":
+        try:
+            with open(Path(args.model) / "config.json") as fh:
+                ARCH = "inkling" if "inkling" in (json.load(fh).get("model_type") or "") else "glm"
+        except OSError:
+            ARCH = "glm"
+    if args.model_id is None:
+        args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
